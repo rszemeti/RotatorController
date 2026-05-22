@@ -11,6 +11,11 @@ const long TOTAL_STEPS = (long)STEPS_PER_REV * MICROSTEPS * GEAR_RATIO;
 // Pin definitions
 const int stepPin = 9;
 const int dirPin = 8;
+const int serialTxPin = 4;
+const int serialRxPin = 5;
+const unsigned long serialBaudRate = 19200;
+
+#define ROTATOR_SERIAL Serial2
 
 // EEPROM addresses
 const int EEPROM_MAGIC_ADDR = 0;
@@ -50,7 +55,9 @@ float lastSavedAccel = 0;
 const long POSITION_SAVE_THRESHOLD = 50;
 
 void setup() {
-  Serial.begin(115200);
+  ROTATOR_SERIAL.setTX(serialTxPin);
+  ROTATOR_SERIAL.setRX(serialRxPin);
+  ROTATOR_SERIAL.begin(serialBaudRate);
   
   engine.init();
   
@@ -71,16 +78,16 @@ void setup() {
     lastSavedAccel = currentAccel;
     lastSavedPosition = stepper->getCurrentPosition();
     
-    Serial.println(F("=== Rotator Ready (Smart EEPROM) ==="));
-    Serial.print(F("Steps/360: ")); Serial.println(TOTAL_STEPS);
-    Serial.print(F("Loaded Position: ")); Serial.print(getCurrentAngle(), 2); Serial.println(F("°"));
-    Serial.print(F("Loaded Speed: ")); Serial.println(currentMaxSpeed, 0);
-    Serial.print(F("Loaded Accel: ")); Serial.println(currentAccel, 0);
-    Serial.println(F("GUI Ready"));
+    ROTATOR_SERIAL.println(F("=== Rotator Ready (Smart EEPROM) ==="));
+    ROTATOR_SERIAL.print(F("Steps/360: ")); ROTATOR_SERIAL.println(TOTAL_STEPS);
+    ROTATOR_SERIAL.print(F("Loaded Position: ")); ROTATOR_SERIAL.print(getCurrentAngle(), 2); ROTATOR_SERIAL.println(F("°"));
+    ROTATOR_SERIAL.print(F("Loaded Speed: ")); ROTATOR_SERIAL.println(currentMaxSpeed, 0);
+    ROTATOR_SERIAL.print(F("Loaded Accel: ")); ROTATOR_SERIAL.println(currentAccel, 0);
+    ROTATOR_SERIAL.println(F("GUI Ready"));
     
     printPosition();
   } else {
-    Serial.println(F("ERROR: Stepper init failed!"));
+    ROTATOR_SERIAL.println(F("ERROR: Stepper init failed!"));
   }
 }
 
@@ -111,8 +118,8 @@ void loop() {
   }
   
   // Process commands
-  if (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\n');
+  if (ROTATOR_SERIAL.available() > 0) {
+    String command = ROTATOR_SERIAL.readStringUntil('\n');
     command.trim();
     command.toUpperCase();
     processCommand(command);
@@ -180,7 +187,7 @@ void processCommand(String command) {
   }
   else if (command == "LOAD") {
     loadFromEEPROM();
-    Serial.println(F("LOADED"));
+    ROTATOR_SERIAL.println(F("LOADED"));
     printPosition();
   }
   else if (command == "RESET") {
@@ -205,8 +212,8 @@ void startPanning(int direction) {
     stepper->runBackward();
   }
   
-  Serial.print(F("PAN:")); 
-  Serial.println(direction > 0 ? 'R' : 'L');
+  ROTATOR_SERIAL.print(F("PAN:")); 
+  ROTATOR_SERIAL.println(direction > 0 ? 'R' : 'L');
 }
 
 void stopPanning() {
@@ -232,8 +239,8 @@ void goToAngle(float targetAngle) {
   
   long targetSteps = (long)(targetAngle * TOTAL_STEPS / 360.0);
   
-  Serial.print(F("GO:")); 
-  Serial.println(targetAngle, 1);
+  ROTATOR_SERIAL.print(F("GO:")); 
+  ROTATOR_SERIAL.println(targetAngle, 1);
   
   stepper->moveTo(targetSteps);
 }
@@ -249,17 +256,17 @@ void setCurrentPosition(float angle) {
   savePositionToEEPROM(newPos);
   lastSavedPosition = newPos;
   
-  Serial.print(F("SET:")); 
-  Serial.println(angle, 1);
+  ROTATOR_SERIAL.print(F("SET:")); 
+  ROTATOR_SERIAL.println(angle, 1);
 }
 
 void setSpeed(float speed) {
   if (speed < 100) {
-    Serial.println(F("Speed too low, setting to 100"));
+    ROTATOR_SERIAL.println(F("Speed too low, setting to 100"));
     speed = 100;
   }
   if (speed > 50000) {
-    Serial.println(F("Speed too high, limiting to 50000"));
+    ROTATOR_SERIAL.println(F("Speed too high, limiting to 50000"));
     speed = 50000;
   }
   
@@ -272,17 +279,17 @@ void setSpeed(float speed) {
     lastSavedSpeed = speed;
   }
   
-  Serial.print(F("SPD:")); 
-  Serial.println(speed, 0);
+  ROTATOR_SERIAL.print(F("SPD:")); 
+  ROTATOR_SERIAL.println(speed, 0);
 }
 
 void setAcceleration(float accel) {
   if (accel < 100) {
-    Serial.println(F("Accel too low, setting to 100"));
+    ROTATOR_SERIAL.println(F("Accel too low, setting to 100"));
     accel = 100;
   }
   if (accel > 100000) {
-    Serial.println(F("Accel too high, limiting to 100000"));
+    ROTATOR_SERIAL.println(F("Accel too high, limiting to 100000"));
     accel = 100000;
   }
   
@@ -295,8 +302,8 @@ void setAcceleration(float accel) {
     lastSavedAccel = accel;
   }
   
-  Serial.print(F("ACC:")); 
-  Serial.println(accel, 0);
+  ROTATOR_SERIAL.print(F("ACC:")); 
+  ROTATOR_SERIAL.println(accel, 0);
 }
 
 void printPosition() {
@@ -306,34 +313,34 @@ void printPosition() {
   while (currentAngle < 0) currentAngle += 360.0;
   while (currentAngle >= 360.0) currentAngle -= 360.0;
   
-  Serial.print(F("Position: "));
-  Serial.print(currentAngle, 2);
-  Serial.println(F("°"));
+  ROTATOR_SERIAL.print(F("Position: "));
+  ROTATOR_SERIAL.print(currentAngle, 2);
+  ROTATOR_SERIAL.println(F("°"));
 }
 
 void printInfo() {
-  Serial.println(F("\n=== Settings ==="));
-  Serial.print(F("MaxSpeed: ")); Serial.println(currentMaxSpeed, 0);
-  Serial.print(F("Accel: ")); Serial.println(currentAccel, 0);
-  Serial.print(F("PanSpeed: ")); Serial.println(PAN_CONSTANT_SPEED);
-  Serial.print(F("Steps/360: ")); Serial.println(TOTAL_STEPS);
-  Serial.print(F("Panning: ")); Serial.println(isPanning ? F("YES") : F("NO"));
+  ROTATOR_SERIAL.println(F("\n=== Settings ==="));
+  ROTATOR_SERIAL.print(F("MaxSpeed: ")); ROTATOR_SERIAL.println(currentMaxSpeed, 0);
+  ROTATOR_SERIAL.print(F("Accel: ")); ROTATOR_SERIAL.println(currentAccel, 0);
+  ROTATOR_SERIAL.print(F("PanSpeed: ")); ROTATOR_SERIAL.println(PAN_CONSTANT_SPEED);
+  ROTATOR_SERIAL.print(F("Steps/360: ")); ROTATOR_SERIAL.println(TOTAL_STEPS);
+  ROTATOR_SERIAL.print(F("Panning: ")); ROTATOR_SERIAL.println(isPanning ? F("YES") : F("NO"));
   
   // Show EEPROM status
-  Serial.print(F("Position delta: ")); 
-  Serial.print(abs(stepper->getCurrentPosition() - lastSavedPosition));
-  Serial.print(F(" (saves at ")); Serial.print(POSITION_SAVE_THRESHOLD); Serial.println(F(")"));
+  ROTATOR_SERIAL.print(F("Position delta: ")); 
+  ROTATOR_SERIAL.print(abs(stepper->getCurrentPosition() - lastSavedPosition));
+  ROTATOR_SERIAL.print(F(" (saves at ")); ROTATOR_SERIAL.print(POSITION_SAVE_THRESHOLD); ROTATOR_SERIAL.println(F(")"));
   
-  Serial.print(F("Speed saved: ")); 
-  Serial.println(abs(currentMaxSpeed - lastSavedSpeed) < 1.0 ? F("YES") : F("NO"));
+  ROTATOR_SERIAL.print(F("Speed saved: ")); 
+  ROTATOR_SERIAL.println(abs(currentMaxSpeed - lastSavedSpeed) < 1.0 ? F("YES") : F("NO"));
   
-  Serial.print(F("Accel saved: ")); 
-  Serial.println(abs(currentAccel - lastSavedAccel) < 1.0 ? F("YES") : F("NO"));
+  ROTATOR_SERIAL.print(F("Accel saved: ")); 
+  ROTATOR_SERIAL.println(abs(currentAccel - lastSavedAccel) < 1.0 ? F("YES") : F("NO"));
   
   uint16_t magic;
   EEPROM.get(EEPROM_MAGIC_ADDR, magic);
-  Serial.print(F("EEPROM Magic: 0x")); 
-  Serial.println(magic, HEX);
+  ROTATOR_SERIAL.print(F("EEPROM Magic: 0x")); 
+  ROTATOR_SERIAL.println(magic, HEX);
   
   printPosition();
 }
@@ -352,8 +359,8 @@ void loadFromEEPROM() {
   uint16_t magic;
   EEPROM.get(EEPROM_MAGIC_ADDR, magic);
   
-  Serial.print(F("EEPROM Magic: 0x"));
-  Serial.println(magic, HEX);
+  ROTATOR_SERIAL.print(F("EEPROM Magic: 0x"));
+  ROTATOR_SERIAL.println(magic, HEX);
   
   if (magic == EEPROM_MAGIC) {
     // Load position
@@ -365,13 +372,13 @@ void loadFromEEPROM() {
     // Load speed
     float savedSpeed;
     EEPROM.get(EEPROM_SPEED_ADDR, savedSpeed);
-    Serial.print(F("EEPROM Speed: ")); Serial.println(savedSpeed, 0);
+    ROTATOR_SERIAL.print(F("EEPROM Speed: ")); ROTATOR_SERIAL.println(savedSpeed, 0);
     
     if (savedSpeed >= 100 && savedSpeed <= 50000) {
       currentMaxSpeed = savedSpeed;
       lastSavedSpeed = savedSpeed;
     } else {
-      Serial.println(F("Speed out of range, using default"));
+      ROTATOR_SERIAL.println(F("Speed out of range, using default"));
       currentMaxSpeed = DEFAULT_SPEED;
       lastSavedSpeed = DEFAULT_SPEED;
       // Fix corrupted speed in EEPROM
@@ -381,22 +388,22 @@ void loadFromEEPROM() {
     // Load acceleration
     float savedAccel;
     EEPROM.get(EEPROM_ACCEL_ADDR, savedAccel);
-    Serial.print(F("EEPROM Accel: ")); Serial.println(savedAccel, 0);
+    ROTATOR_SERIAL.print(F("EEPROM Accel: ")); ROTATOR_SERIAL.println(savedAccel, 0);
     
     if (savedAccel >= 100 && savedAccel <= 100000) {
       currentAccel = savedAccel;
       lastSavedAccel = savedAccel;
     } else {
-      Serial.println(F("Accel out of range, using default"));
+      ROTATOR_SERIAL.println(F("Accel out of range, using default"));
       currentAccel = DEFAULT_ACCEL;
       lastSavedAccel = DEFAULT_ACCEL;
       // Fix corrupted accel in EEPROM
       EEPROM.put(EEPROM_ACCEL_ADDR, DEFAULT_ACCEL);
     }
     
-    Serial.println(F("EEPROM: Loaded"));
+    ROTATOR_SERIAL.println(F("EEPROM: Loaded"));
   } else {
-    Serial.println(F("EEPROM: No valid data, initializing defaults"));
+    ROTATOR_SERIAL.println(F("EEPROM: No valid data, initializing defaults"));
     currentMaxSpeed = DEFAULT_SPEED;
     currentAccel = DEFAULT_ACCEL;
     stepper->setCurrentPosition(0);
@@ -410,7 +417,7 @@ void loadFromEEPROM() {
     EEPROM.put(EEPROM_POSITION_ADDR, 0L);
     EEPROM.put(EEPROM_SPEED_ADDR, DEFAULT_SPEED);
     EEPROM.put(EEPROM_ACCEL_ADDR, DEFAULT_ACCEL);
-    Serial.println(F("EEPROM: Initialized"));
+    ROTATOR_SERIAL.println(F("EEPROM: Initialized"));
   }
 }
 
@@ -430,10 +437,10 @@ void saveAccelToEEPROM(float accel) {
 void forceSaveAll() {
   long currentPos = stepper->getCurrentPosition();
   
-  Serial.println(F("Force saving all to EEPROM:"));
-  Serial.print(F("  Position: ")); Serial.println(currentPos);
-  Serial.print(F("  Speed: ")); Serial.println(currentMaxSpeed, 0);
-  Serial.print(F("  Accel: ")); Serial.println(currentAccel, 0);
+  ROTATOR_SERIAL.println(F("Force saving all to EEPROM:"));
+  ROTATOR_SERIAL.print(F("  Position: ")); ROTATOR_SERIAL.println(currentPos);
+  ROTATOR_SERIAL.print(F("  Speed: ")); ROTATOR_SERIAL.println(currentMaxSpeed, 0);
+  ROTATOR_SERIAL.print(F("  Accel: ")); ROTATOR_SERIAL.println(currentAccel, 0);
   
   EEPROM.put(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
   EEPROM.put(EEPROM_POSITION_ADDR, currentPos);
@@ -444,11 +451,11 @@ void forceSaveAll() {
   lastSavedSpeed = currentMaxSpeed;
   lastSavedAccel = currentAccel;
   
-  Serial.println(F("SAVED"));
+  ROTATOR_SERIAL.println(F("SAVED"));
 }
 
 void resetEEPROM() {
-  Serial.println(F("EEPROM: Resetting to defaults"));
+  ROTATOR_SERIAL.println(F("EEPROM: Resetting to defaults"));
   
   // Reset to defaults
   currentMaxSpeed = DEFAULT_SPEED;
@@ -467,7 +474,7 @@ void resetEEPROM() {
   EEPROM.put(EEPROM_SPEED_ADDR, DEFAULT_SPEED);
   EEPROM.put(EEPROM_ACCEL_ADDR, DEFAULT_ACCEL);
   
-  Serial.println(F("RESET"));
-  Serial.print(F("  Speed: ")); Serial.println(DEFAULT_SPEED, 0);
-  Serial.print(F("  Accel: ")); Serial.println(DEFAULT_ACCEL, 0);
+  ROTATOR_SERIAL.println(F("RESET"));
+  ROTATOR_SERIAL.print(F("  Speed: ")); ROTATOR_SERIAL.println(DEFAULT_SPEED, 0);
+  ROTATOR_SERIAL.print(F("  Accel: ")); ROTATOR_SERIAL.println(DEFAULT_ACCEL, 0);
 }

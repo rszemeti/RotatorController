@@ -1226,7 +1226,7 @@ class RotatorGUI:
             self.connect_btn.config(state='disabled')
             self.disconnect_btn.config(state='normal')
             
-            self.serial_port = serial.Serial(port, 115200, timeout=1)
+            self.serial_port = serial.Serial(port, 19200, timeout=1)
             time.sleep(2)
             
             self.status_label.config(text="Connecting - Validating...", fg="#ffaa44")
