@@ -68,11 +68,11 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 class SettingsDialog:
-    def __init__(self, parent, current_speed, current_accel):
+    def __init__(self, parent, current_speed, current_accel, current_steps_per_rev):
         self.result = None
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Motion Settings")
-        self.dialog.geometry("400x250")
+        self.dialog.geometry("460x300")
         self.dialog.resizable(False, False)
         self.dialog.configure(bg="#2b2b2b")
         
@@ -110,6 +110,17 @@ class SettingsDialog:
         
         tk.Label(settings_frame, text="steps/s² (100-100000)", bg="#2b2b2b", fg="#888888",
                 font=('Arial', 9)).grid(row=1, column=2, padx=5, pady=10, sticky='w')
+
+        # Steps per revolution setting
+        tk.Label(settings_frame, text="Steps / 360°:", bg="#2b2b2b", fg="#ffffff",
+            font=('Arial', 10)).grid(row=2, column=0, padx=10, pady=10, sticky='e')
+
+        self.steps_entry = tk.Entry(settings_frame, width=10, font=('Arial', 11))
+        self.steps_entry.grid(row=2, column=1, padx=5, pady=10)
+        self.steps_entry.insert(0, str(current_steps_per_rev))
+
+        tk.Label(settings_frame, text="steps (1000-10000000)", bg="#2b2b2b", fg="#888888",
+            font=('Arial', 9)).grid(row=2, column=2, padx=5, pady=10, sticky='w')
         
         # Buttons
         button_frame = tk.Frame(self.dialog, bg="#2b2b2b")
@@ -129,6 +140,7 @@ class SettingsDialog:
         try:
             speed = float(self.speed_entry.get())
             accel = float(self.accel_entry.get())
+            steps = int(float(self.steps_entry.get()))
             
             if not (100 <= speed <= 50000):
                 messagebox.showerror("Error", "Speed must be 100-50000 steps/s", parent=self.dialog)
@@ -137,8 +149,12 @@ class SettingsDialog:
             if not (100 <= accel <= 100000):
                 messagebox.showerror("Error", "Acceleration must be 100-100000 steps/s²", parent=self.dialog)
                 return
+
+            if not (1000 <= steps <= 10000000):
+                messagebox.showerror("Error", "Steps/360 must be 1000-10000000", parent=self.dialog)
+                return
             
-            self.result = (speed, accel)
+            self.result = (speed, accel, steps)
             self.dialog.destroy()
         except ValueError:
             messagebox.showerror("Error", "Invalid values", parent=self.dialog)
@@ -404,6 +420,7 @@ class RotatorGUI:
         # Current settings
         self.current_speed = 4000
         self.current_accel = 2000
+        self.current_steps_per_rev = 100000
         
         # Pan refresh settings
         self.pan_refresh_interval = 0.5
@@ -873,6 +890,9 @@ class RotatorGUI:
                     # Load stations
                     self.stations = settings.get('stations', [])
                     self.update_stations_list()
+
+                    # Load last known steps/360 for settings dialog defaults
+                    self.current_steps_per_rev = int(settings.get('steps_per_rev', self.current_steps_per_rev))
         except Exception as e:
             print(f"Error loading settings: {e}")
     
@@ -882,7 +902,8 @@ class RotatorGUI:
             settings = {
                 'last_port': self.port_var.get(),
                 'my_locator': self.my_locator,
-                'stations': self.stations
+                'stations': self.stations,
+                'steps_per_rev': int(self.current_steps_per_rev)
             }
             with open(self.SETTINGS_FILE, 'w') as f:
                 json.dump(settings, f, indent=2)
@@ -929,13 +950,16 @@ class RotatorGUI:
         return error
     
     def open_settings_dialog(self):
-        dialog = SettingsDialog(self.root, self.current_speed, self.current_accel)
+        dialog = SettingsDialog(self.root, self.current_speed, self.current_accel, self.current_steps_per_rev)
         self.root.wait_window(dialog.dialog)
         
         if dialog.result:
-            speed, accel = dialog.result
+            speed, accel, steps_per_rev = dialog.result
             self.send_command(f"S{speed}")
             self.send_command(f"AC{accel}")
+            self.send_command(f"STEPS{steps_per_rev}")
+            self.current_steps_per_rev = int(steps_per_rev)
+            self.save_settings()
     
     def open_set_position_dialog(self):
         dialog = SetPositionDialog(self.root, self.current_angle)
@@ -1236,12 +1260,15 @@ class RotatorGUI:
             
             self.running = True
             self.connection_validated = False
+            # Clear stale target on reconnect; controller does not persist/announce target intent.
+            self.has_target = False
             self.reading_thread = threading.Thread(target=self.read_serial, daemon=True)
             self.reading_thread.start()
             
             # Request position to validate connection
             time.sleep(0.5)
             self.send_command("P")
+            self.send_command("INFO")
             
             # Start validation check
             self.root.after(int(self.validation_timeout * 1000), self.check_connection_validation)
@@ -1268,6 +1295,7 @@ class RotatorGUI:
     def disconnect(self):
         self.running = False
         self.connection_validated = False
+        self.has_target = False
         self.stop_pan()
         if self.serial_port and self.serial_port.is_open:
             self.send_command("PANSTOP")
@@ -1295,6 +1323,11 @@ class RotatorGUI:
     def parse_response(self, line):
         if not line:
             return
+
+        # Firmware rebooted on an existing connection; clear stale target intent.
+        if "Rotator Ready" in line or line.strip() == "GUI Ready":
+            self.target_angle = self.current_angle
+            self.has_target = True
         
         # Mark connection as validated on any valid response
         if not self.connection_validated and (line.startswith("Position:") or 
@@ -1302,8 +1335,11 @@ class RotatorGUI:
                                               line.startswith("SET:") or 
                                               line.startswith("SPD:") or 
                                               line.startswith("ACC:") or 
+                                              line.startswith("STEPS:") or
+                                              "Loaded Position:" in line or
                                               "Loaded Speed:" in line or 
-                                              "Loaded Accel:" in line):
+                                              "Loaded Accel:" in line or
+                                              "Loaded Steps/360:" in line):
             self.connection_validated = True
             self.status_label.config(text="Connected - EEPROM Enabled", fg="#44ff44")
             print("Connection validated - received response from controller")
@@ -1338,10 +1374,26 @@ class RotatorGUI:
                 self.has_target = False
             except:
                 pass
+
+        elif "Loaded Position:" in line:
+            try:
+                angle = float(line.split(":")[1].strip().rstrip("°"))
+                self.current_angle = angle
+                self.target_angle = angle
+                self.has_target = True
+            except:
+                pass
         
         elif line.startswith("SPD:"):
             try:
                 speed = int(float(line.split(":")[1]))
+                self.current_speed = speed
+            except:
+                pass
+
+        elif line.startswith("MaxSpeed:"):
+            try:
+                speed = int(float(line.split(":")[1].strip()))
                 self.current_speed = speed
             except:
                 pass
@@ -1350,6 +1402,29 @@ class RotatorGUI:
             try:
                 accel = int(float(line.split(":")[1]))
                 self.current_accel = accel
+            except:
+                pass
+
+        elif line.startswith("Accel:"):
+            try:
+                accel = int(float(line.split(":")[1].strip()))
+                self.current_accel = accel
+            except:
+                pass
+
+        elif line.startswith("STEPS:"):
+            try:
+                steps = int(float(line.split(":")[1]))
+                self.current_steps_per_rev = steps
+                self.save_settings()
+            except:
+                pass
+
+        elif line.startswith("Steps/360:"):
+            try:
+                steps = int(float(line.split(":")[1].strip()))
+                self.current_steps_per_rev = steps
+                self.save_settings()
             except:
                 pass
         
@@ -1366,13 +1441,21 @@ class RotatorGUI:
                 self.current_accel = accel
             except:
                 pass
+
+        elif "Loaded Steps/360:" in line:
+            try:
+                steps = int(float(line.split(":")[1].strip()))
+                self.current_steps_per_rev = steps
+                self.save_settings()
+            except:
+                pass
         
-        if line and not line.startswith("Position:"):
-            print(f"Arduino: {line}")
+        print(f"RX: {line}")
     
     def send_command(self, cmd):
         if self.serial_port and self.serial_port.is_open:
             try:
+                print(f"TX: {cmd}")
                 self.serial_port.write(f"{cmd}\n".encode())
             except Exception as e:
                 print(f"Send error: {e}")
@@ -1442,6 +1525,9 @@ class RotatorGUI:
             self.target_angle = angle
             self.has_target = True
             self.send_command(f"A{angle}")
+            # Force near-term position refresh so current display doesn't stay stale.
+            self.root.after(300, lambda: self.send_command("P"))
+            self.root.after(1200, lambda: self.send_command("P"))
         else:
             messagebox.showerror("Error", "Angle must be between 0 and 360")
     
@@ -1449,6 +1535,8 @@ class RotatorGUI:
         self.target_angle = 0
         self.has_target = True
         self.send_command("H")
+        self.root.after(300, lambda: self.send_command("P"))
+        self.root.after(1200, lambda: self.send_command("P"))
     
     def emergency_stop(self):
         self.stop_pan()

@@ -6,14 +6,16 @@
 const int STEPS_PER_REV = 200;
 const int GEAR_RATIO = 50;
 const int MICROSTEPS = 10;
-const long TOTAL_STEPS = (long)STEPS_PER_REV * MICROSTEPS * GEAR_RATIO;
+const long DEFAULT_TOTAL_STEPS = (long)STEPS_PER_REV * MICROSTEPS * GEAR_RATIO;
 
 // Pin definitions
 const int stepPin = 9;
 const int dirPin = 8;
+const int driveDisablePin = 10;
 const int serialTxPin = 4;
 const int serialRxPin = 5;
 const unsigned long serialBaudRate = 19200;
+const unsigned long usbBaudRate = 115200;
 
 #define ROTATOR_SERIAL Serial2
 
@@ -22,6 +24,8 @@ const int EEPROM_MAGIC_ADDR = 0;
 const int EEPROM_POSITION_ADDR = 4;
 const int EEPROM_SPEED_ADDR = 8;
 const int EEPROM_ACCEL_ADDR = 12;
+const int EEPROM_STEPS_ADDR = 16;
+const int EEPROM_SIZE_BYTES = 512;
 const uint16_t EEPROM_MAGIC = 0xAE42;
 
 // Default values
@@ -35,29 +39,91 @@ FastAccelStepper *stepper = NULL;
 // Current settings
 float currentMaxSpeed = DEFAULT_SPEED;
 float currentAccel = DEFAULT_ACCEL;
+long currentStepsPerRevolution = DEFAULT_TOTAL_STEPS;
+float positionAngleOffsetDeg = 0.0;
 
 // Panning state
 bool isPanning = false;
 int panDirection = 0;
 unsigned long lastPanCommandTime = 0;
 const unsigned long PAN_TIMEOUT = 1000;
+bool hasActiveTarget = false;
+long activeTargetSteps = 0;
+const long ACTIVE_TARGET_DEADBAND_STEPS = 20;
 
 // Position update and save intervals
 unsigned long lastPositionUpdate = 0;
 const unsigned long positionUpdateInterval = 200;
 unsigned long lastPositionSave = 0;
 const unsigned long positionSaveInterval = 5000;
+const unsigned long positionIdleForceSaveInterval = 30000;
+unsigned long lastMotionForPositionSave = 0;
+
+// External drive-disable pin control (active HIGH disables, LOW enables)
+const unsigned long driveEnableSettleMs = 500;
+const unsigned long driveIdleDisableMs = 10000;
+bool driveEnabled = false;
+unsigned long lastMotionActivityMs = 0;
 
 // Track what's been saved to avoid unnecessary writes
 long lastSavedPosition = 0;
 float lastSavedSpeed = 0;
 float lastSavedAccel = 0;
+long lastSavedStepsPerRevolution = DEFAULT_TOTAL_STEPS;
 const long POSITION_SAVE_THRESHOLD = 50;
 
+float normalizeAngleDeg(float angle) {
+  while (angle < 0) angle += 360.0;
+  while (angle >= 360.0) angle -= 360.0;
+  return angle;
+}
+
+long calculateNearestTargetSteps(float targetAngle, long referencePos) {
+  float relativeTargetAngle = normalizeAngleDeg(targetAngle - positionAngleOffsetDeg);
+  long targetStepsBase = (long)round((double)relativeTargetAngle * (double)currentStepsPerRevolution / 360.0);
+  long nearestTurn = (long)round((double)(referencePos - targetStepsBase) / (double)currentStepsPerRevolution);
+  return targetStepsBase + nearestTurn * currentStepsPerRevolution;
+}
+
+void updateActiveTargetControl() {
+  if (!hasActiveTarget || isPanning) {
+    return;
+  }
+
+  long currentPos = stepper->getCurrentPosition();
+  if (abs(activeTargetSteps - currentPos) <= ACTIVE_TARGET_DEADBAND_STEPS) {
+    hasActiveTarget = false;
+    return;
+  }
+
+  if (!stepper->isRunning()) {
+    prepareDriveForMotion();
+    stepper->moveTo(activeTargetSteps);
+  }
+}
+
+void commitEEPROM() {
+  EEPROM.commit();
+}
+
 void setup() {
+  pinMode(driveDisablePin, OUTPUT);
+  setDriveEnabled(false);
+
+  Serial.begin(usbBaudRate);
+  unsigned long serialStart = millis();
+  while (!Serial && (millis() - serialStart < 2000)) {
+    delay(10);
+  }
+  if (Serial) {
+    Serial.println(F("BOOT OK"));
+  }
+
   ROTATOR_SERIAL.setTX(serialTxPin);
   ROTATOR_SERIAL.setRX(serialRxPin);
   ROTATOR_SERIAL.begin(serialBaudRate);
+
+  EEPROM.begin(EEPROM_SIZE_BYTES);
   
   engine.init();
   
@@ -76,10 +142,11 @@ void setup() {
     // Initialize "last saved" trackers
     lastSavedSpeed = currentMaxSpeed;
     lastSavedAccel = currentAccel;
+    lastSavedStepsPerRevolution = currentStepsPerRevolution;
     lastSavedPosition = stepper->getCurrentPosition();
     
     ROTATOR_SERIAL.println(F("=== Rotator Ready (Smart EEPROM) ==="));
-    ROTATOR_SERIAL.print(F("Steps/360: ")); ROTATOR_SERIAL.println(TOTAL_STEPS);
+    ROTATOR_SERIAL.print(F("Loaded Steps/360: ")); ROTATOR_SERIAL.println(currentStepsPerRevolution);
     ROTATOR_SERIAL.print(F("Loaded Position: ")); ROTATOR_SERIAL.print(getCurrentAngle(), 2); ROTATOR_SERIAL.println(F("°"));
     ROTATOR_SERIAL.print(F("Loaded Speed: ")); ROTATOR_SERIAL.println(currentMaxSpeed, 0);
     ROTATOR_SERIAL.print(F("Loaded Accel: ")); ROTATOR_SERIAL.println(currentAccel, 0);
@@ -98,6 +165,14 @@ void loop() {
       stopPanning();
     }
   }
+
+  updateDriveIdleState();
+
+  updateActiveTargetControl();
+
+  if (isPanning || stepper->isRunning()) {
+    lastMotionForPositionSave = millis();
+  }
   
   // Position updates
   if (millis() - lastPositionUpdate >= positionUpdateInterval) {
@@ -115,6 +190,16 @@ void loop() {
       lastSavedPosition = currentPos;
     }
     lastPositionSave = millis();
+  }
+
+  // Fallback save: if position changed and has been idle for a while, persist once.
+  if (!isPanning && !stepper->isRunning() &&
+      (millis() - lastMotionForPositionSave >= positionIdleForceSaveInterval)) {
+    long currentPos = stepper->getCurrentPosition();
+    if (currentPos != lastSavedPosition) {
+      savePositionToEEPROM(currentPos);
+      lastSavedPosition = currentPos;
+    }
   }
   
   // Process commands
@@ -168,6 +253,7 @@ void processCommand(String command) {
   }
   else if (command == "STOP") {
     stopPanning();
+    hasActiveTarget = false;
     stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
     
     // Save position immediately on emergency stop
@@ -178,6 +264,10 @@ void processCommand(String command) {
     }
   }
   // Check S but exclude SETPOS, STOP, and SAVE
+  else if (command.startsWith("STEPS")) {
+    long steps = command.substring(5).toInt();
+    setStepsPerRevolution(steps);
+  }
   else if (command.startsWith("S") && !command.startsWith("SETPOS") && !command.startsWith("STOP") && !command.startsWith("SAVE")) {
     float speed = command.substring(1).toFloat();
     setSpeed(speed);
@@ -200,6 +290,8 @@ void processCommand(String command) {
 
 
 void startPanning(int direction) {
+  hasActiveTarget = false;
+  prepareDriveForMotion();
   isPanning = true;
   panDirection = direction;
   lastPanCommandTime = millis();
@@ -237,24 +329,69 @@ void goToAngle(float targetAngle) {
   while (targetAngle < 0) targetAngle += 360.0;
   while (targetAngle >= 360.0) targetAngle -= 360.0;
   
-  long targetSteps = (long)(targetAngle * TOTAL_STEPS / 360.0);
+  long currentPos = stepper->getCurrentPosition();
+  activeTargetSteps = calculateNearestTargetSteps(targetAngle, currentPos);
+  hasActiveTarget = true;
+  float currentAngle = getCurrentAngle();
+  long deltaSteps = activeTargetSteps - currentPos;
   
   ROTATOR_SERIAL.print(F("GO:")); 
   ROTATOR_SERIAL.println(targetAngle, 1);
+  ROTATOR_SERIAL.print(F("GO DBG cur="));
+  ROTATOR_SERIAL.print(currentPos);
+  ROTATOR_SERIAL.print(F(" curAng="));
+  ROTATOR_SERIAL.print(currentAngle, 2);
+  ROTATOR_SERIAL.print(F(" dAng="));
+  ROTATOR_SERIAL.print(targetAngle - currentAngle, 2);
+  ROTATOR_SERIAL.print(F(" dStp="));
+  ROTATOR_SERIAL.print(deltaSteps);
+  ROTATOR_SERIAL.print(F(" tgt="));
+  ROTATOR_SERIAL.print(activeTargetSteps);
+  ROTATOR_SERIAL.print(F(" spr="));
+  ROTATOR_SERIAL.println(currentStepsPerRevolution);
   
-  stepper->moveTo(targetSteps);
+  if (deltaSteps != 0) {
+    prepareDriveForMotion();
+    stepper->moveTo(activeTargetSteps);
+  }
+}
+
+void setDriveEnabled(bool enabled) {
+  pinMode(driveDisablePin, OUTPUT);
+  digitalWrite(driveDisablePin, enabled ? LOW : HIGH);
+  driveEnabled = enabled;
+}
+
+void prepareDriveForMotion() {
+  if (!driveEnabled) {
+    setDriveEnabled(true);
+    delay(driveEnableSettleMs);
+  }
+  lastMotionActivityMs = millis();
+}
+
+void updateDriveIdleState() {
+  if (isPanning || stepper->isRunning()) {
+    lastMotionActivityMs = millis();
+    return;
+  }
+
+  if (driveEnabled && (millis() - lastMotionActivityMs >= driveIdleDisableMs)) {
+    setDriveEnabled(false);
+  }
 }
 
 void setCurrentPosition(float angle) {
-  while (angle < 0) angle += 360.0;
-  while (angle >= 360.0) angle -= 360.0;
-  
-  long newPos = (long)(angle * TOTAL_STEPS / 360.0);
-  stepper->setCurrentPosition(newPos);
+  angle = normalizeAngleDeg(angle);
+
+  long currentSteps = stepper->getCurrentPosition();
+  float relativeAngle = (float)currentSteps * 360.0 / currentStepsPerRevolution;
+  positionAngleOffsetDeg = normalizeAngleDeg(angle - relativeAngle);
+  hasActiveTarget = false;
   
   // Always save immediately when position is manually set
-  savePositionToEEPROM(newPos);
-  lastSavedPosition = newPos;
+  savePositionToEEPROM(currentSteps);
+  lastSavedPosition = currentSteps;
   
   ROTATOR_SERIAL.print(F("SET:")); 
   ROTATOR_SERIAL.println(angle, 1);
@@ -306,12 +443,52 @@ void setAcceleration(float accel) {
   ROTATOR_SERIAL.println(accel, 0);
 }
 
+void setStepsPerRevolution(long steps) {
+  if (steps < 1000) {
+    ROTATOR_SERIAL.println(F("Steps/360 too low, setting to 1000"));
+    steps = 1000;
+  }
+  if (steps > 10000000) {
+    ROTATOR_SERIAL.println(F("Steps/360 too high, limiting to 10000000"));
+    steps = 10000000;
+  }
+
+  if (isPanning || stepper->isRunning()) {
+    ROTATOR_SERIAL.println(F("Cannot change Steps/360 while moving"));
+    return;
+  }
+
+  long oldStepsPerRevolution = currentStepsPerRevolution;
+  if (steps == oldStepsPerRevolution) {
+    ROTATOR_SERIAL.print(F("STEPS:"));
+    ROTATOR_SERIAL.println(steps);
+    return;
+  }
+
+  long currentPos = stepper->getCurrentPosition();
+  float currentAngle = getCurrentAngle();
+  float relativeAngle = normalizeAngleDeg(currentAngle - positionAngleOffsetDeg);
+
+  long remappedBase = (long)round((double)relativeAngle * (double)steps / 360.0);
+  long nearestTurn = (long)round((double)(currentPos - remappedBase) / (double)steps);
+  long remappedPos = remappedBase + nearestTurn * steps;
+  stepper->setCurrentPosition(remappedPos);
+
+  currentStepsPerRevolution = steps;
+  savePositionToEEPROM(remappedPos);
+  lastSavedPosition = remappedPos;
+
+  if (steps != lastSavedStepsPerRevolution) {
+    saveStepsToEEPROM(steps);
+    lastSavedStepsPerRevolution = steps;
+  }
+
+  ROTATOR_SERIAL.print(F("STEPS:"));
+  ROTATOR_SERIAL.println(steps);
+}
+
 void printPosition() {
-  long currentSteps = stepper->getCurrentPosition();
-  float currentAngle = (float)currentSteps * 360.0 / TOTAL_STEPS;
-  
-  while (currentAngle < 0) currentAngle += 360.0;
-  while (currentAngle >= 360.0) currentAngle -= 360.0;
+  float currentAngle = getCurrentAngle();
   
   ROTATOR_SERIAL.print(F("Position: "));
   ROTATOR_SERIAL.print(currentAngle, 2);
@@ -323,7 +500,7 @@ void printInfo() {
   ROTATOR_SERIAL.print(F("MaxSpeed: ")); ROTATOR_SERIAL.println(currentMaxSpeed, 0);
   ROTATOR_SERIAL.print(F("Accel: ")); ROTATOR_SERIAL.println(currentAccel, 0);
   ROTATOR_SERIAL.print(F("PanSpeed: ")); ROTATOR_SERIAL.println(PAN_CONSTANT_SPEED);
-  ROTATOR_SERIAL.print(F("Steps/360: ")); ROTATOR_SERIAL.println(TOTAL_STEPS);
+  ROTATOR_SERIAL.print(F("Steps/360: ")); ROTATOR_SERIAL.println(currentStepsPerRevolution);
   ROTATOR_SERIAL.print(F("Panning: ")); ROTATOR_SERIAL.println(isPanning ? F("YES") : F("NO"));
   
   // Show EEPROM status
@@ -347,10 +524,8 @@ void printInfo() {
 
 float getCurrentAngle() {
   long pos = stepper->getCurrentPosition();
-  float angle = (float)pos * 360.0 / TOTAL_STEPS;
-  while (angle < 0) angle += 360.0;
-  while (angle >= 360.0) angle -= 360.0;
-  return angle;
+  float relativeAngle = (float)pos * 360.0 / currentStepsPerRevolution;
+  return normalizeAngleDeg(relativeAngle + positionAngleOffsetDeg);
 }
 
 // ========== EEPROM Functions ==========
@@ -363,12 +538,6 @@ void loadFromEEPROM() {
   ROTATOR_SERIAL.println(magic, HEX);
   
   if (magic == EEPROM_MAGIC) {
-    // Load position
-    long savedPosition;
-    EEPROM.get(EEPROM_POSITION_ADDR, savedPosition);
-    stepper->setCurrentPosition(savedPosition);
-    lastSavedPosition = savedPosition;
-    
     // Load speed
     float savedSpeed;
     EEPROM.get(EEPROM_SPEED_ADDR, savedSpeed);
@@ -383,6 +552,7 @@ void loadFromEEPROM() {
       lastSavedSpeed = DEFAULT_SPEED;
       // Fix corrupted speed in EEPROM
       EEPROM.put(EEPROM_SPEED_ADDR, DEFAULT_SPEED);
+      commitEEPROM();
     }
     
     // Load acceleration
@@ -399,17 +569,44 @@ void loadFromEEPROM() {
       lastSavedAccel = DEFAULT_ACCEL;
       // Fix corrupted accel in EEPROM
       EEPROM.put(EEPROM_ACCEL_ADDR, DEFAULT_ACCEL);
+      commitEEPROM();
     }
+
+    // Load steps per revolution
+    long savedSteps;
+    EEPROM.get(EEPROM_STEPS_ADDR, savedSteps);
+    ROTATOR_SERIAL.print(F("EEPROM Steps/360: ")); ROTATOR_SERIAL.println(savedSteps);
+
+    if (savedSteps >= 1000 && savedSteps <= 10000000) {
+      currentStepsPerRevolution = savedSteps;
+      lastSavedStepsPerRevolution = savedSteps;
+    } else {
+      ROTATOR_SERIAL.println(F("Steps/360 out of range, using default"));
+      currentStepsPerRevolution = DEFAULT_TOTAL_STEPS;
+      lastSavedStepsPerRevolution = DEFAULT_TOTAL_STEPS;
+      EEPROM.put(EEPROM_STEPS_ADDR, DEFAULT_TOTAL_STEPS);
+      commitEEPROM();
+    }
+
+    // Load saved angle reference and map it to runtime step position 0 at boot.
+    long savedPosition;
+    EEPROM.get(EEPROM_POSITION_ADDR, savedPosition);
+    positionAngleOffsetDeg = normalizeAngleDeg((float)savedPosition * 360.0 / currentStepsPerRevolution);
+    stepper->setCurrentPosition(0);
+    lastSavedPosition = 0;
     
     ROTATOR_SERIAL.println(F("EEPROM: Loaded"));
   } else {
     ROTATOR_SERIAL.println(F("EEPROM: No valid data, initializing defaults"));
     currentMaxSpeed = DEFAULT_SPEED;
     currentAccel = DEFAULT_ACCEL;
+    positionAngleOffsetDeg = 0.0;
+    currentStepsPerRevolution = DEFAULT_TOTAL_STEPS;
     stepper->setCurrentPosition(0);
     
     lastSavedSpeed = DEFAULT_SPEED;
     lastSavedAccel = DEFAULT_ACCEL;
+    lastSavedStepsPerRevolution = DEFAULT_TOTAL_STEPS;
     lastSavedPosition = 0;
     
     // Initialize EEPROM with valid data
@@ -417,39 +614,56 @@ void loadFromEEPROM() {
     EEPROM.put(EEPROM_POSITION_ADDR, 0L);
     EEPROM.put(EEPROM_SPEED_ADDR, DEFAULT_SPEED);
     EEPROM.put(EEPROM_ACCEL_ADDR, DEFAULT_ACCEL);
+    EEPROM.put(EEPROM_STEPS_ADDR, DEFAULT_TOTAL_STEPS);
+    commitEEPROM();
     ROTATOR_SERIAL.println(F("EEPROM: Initialized"));
   }
 }
 
 void savePositionToEEPROM(long position) {
+  (void)position;
   // EEPROM.put only writes if value changed (built-in optimization)
-  EEPROM.put(EEPROM_POSITION_ADDR, position);
+  long storedPosition = (long)round((double)getCurrentAngle() * (double)currentStepsPerRevolution / 360.0);
+  EEPROM.put(EEPROM_POSITION_ADDR, storedPosition);
+  commitEEPROM();
 }
 
 void saveSpeedToEEPROM(float speed) {
   EEPROM.put(EEPROM_SPEED_ADDR, speed);
+  commitEEPROM();
 }
 
 void saveAccelToEEPROM(float accel) {
   EEPROM.put(EEPROM_ACCEL_ADDR, accel);
+  commitEEPROM();
+}
+
+void saveStepsToEEPROM(long steps) {
+  EEPROM.put(EEPROM_STEPS_ADDR, steps);
+  commitEEPROM();
 }
 
 void forceSaveAll() {
   long currentPos = stepper->getCurrentPosition();
+  long storedPosition = (long)round((double)getCurrentAngle() * (double)currentStepsPerRevolution / 360.0);
   
   ROTATOR_SERIAL.println(F("Force saving all to EEPROM:"));
-  ROTATOR_SERIAL.print(F("  Position: ")); ROTATOR_SERIAL.println(currentPos);
+  ROTATOR_SERIAL.print(F("  Position: ")); ROTATOR_SERIAL.println(getCurrentAngle(), 2);
   ROTATOR_SERIAL.print(F("  Speed: ")); ROTATOR_SERIAL.println(currentMaxSpeed, 0);
   ROTATOR_SERIAL.print(F("  Accel: ")); ROTATOR_SERIAL.println(currentAccel, 0);
+  ROTATOR_SERIAL.print(F("  Steps/360: ")); ROTATOR_SERIAL.println(currentStepsPerRevolution);
   
   EEPROM.put(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
-  EEPROM.put(EEPROM_POSITION_ADDR, currentPos);
+  EEPROM.put(EEPROM_POSITION_ADDR, storedPosition);
   EEPROM.put(EEPROM_SPEED_ADDR, currentMaxSpeed);
   EEPROM.put(EEPROM_ACCEL_ADDR, currentAccel);
+  EEPROM.put(EEPROM_STEPS_ADDR, currentStepsPerRevolution);
+  commitEEPROM();
   
   lastSavedPosition = currentPos;
   lastSavedSpeed = currentMaxSpeed;
   lastSavedAccel = currentAccel;
+  lastSavedStepsPerRevolution = currentStepsPerRevolution;
   
   ROTATOR_SERIAL.println(F("SAVED"));
 }
@@ -460,12 +674,15 @@ void resetEEPROM() {
   // Reset to defaults
   currentMaxSpeed = DEFAULT_SPEED;
   currentAccel = DEFAULT_ACCEL;
+  currentStepsPerRevolution = DEFAULT_TOTAL_STEPS;
+  positionAngleOffsetDeg = 0.0;
   stepper->setCurrentPosition(0);
   stepper->setSpeedInHz(currentMaxSpeed);
   stepper->setAcceleration(currentAccel);
   
   lastSavedSpeed = DEFAULT_SPEED;
   lastSavedAccel = DEFAULT_ACCEL;
+  lastSavedStepsPerRevolution = DEFAULT_TOTAL_STEPS;
   lastSavedPosition = 0;
   
   // Write defaults to EEPROM with valid magic number
@@ -473,8 +690,11 @@ void resetEEPROM() {
   EEPROM.put(EEPROM_POSITION_ADDR, 0L);
   EEPROM.put(EEPROM_SPEED_ADDR, DEFAULT_SPEED);
   EEPROM.put(EEPROM_ACCEL_ADDR, DEFAULT_ACCEL);
+  EEPROM.put(EEPROM_STEPS_ADDR, DEFAULT_TOTAL_STEPS);
+  commitEEPROM();
   
   ROTATOR_SERIAL.println(F("RESET"));
   ROTATOR_SERIAL.print(F("  Speed: ")); ROTATOR_SERIAL.println(DEFAULT_SPEED, 0);
   ROTATOR_SERIAL.print(F("  Accel: ")); ROTATOR_SERIAL.println(DEFAULT_ACCEL, 0);
+  ROTATOR_SERIAL.print(F("  Steps/360: ")); ROTATOR_SERIAL.println(DEFAULT_TOTAL_STEPS);
 }
