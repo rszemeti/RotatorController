@@ -522,11 +522,17 @@ class RotatorGUI:
         self.canvas = tk.Canvas(compass_frame, width=400, height=400, 
                                bg=self.compass_bg_color, highlightthickness=0)
         self.canvas.pack()
+
+        # Compass geometry used by draw and click targeting
+        self.compass_cx = 200
+        self.compass_cy = 200
+        self.compass_radius = 160
         
         # Mouse scroll wheel to adjust target heading
         self.canvas.bind('<MouseWheel>', self.on_compass_scroll)  # Windows
         self.canvas.bind('<Button-4>', lambda e: self.on_compass_scroll_linux(e, 1))  # Linux scroll up
         self.canvas.bind('<Button-5>', lambda e: self.on_compass_scroll_linux(e, -1))  # Linux scroll down
+        self.canvas.bind('<Button-1>', self.on_compass_click)
         
         # Angle Display - Below compass
         angle_frame = tk.Frame(left_panel, bg=self.bg_color)
@@ -734,12 +740,31 @@ class RotatorGUI:
         self.target_angle = new_target
         self.has_target = True
         self.send_command(f"A{new_target}")
+
+    def on_compass_click(self, event):
+        """Click outer third of compass ring to set target heading."""
+        if not self.serial_port or not self.serial_port.is_open:
+            return
+
+        dx = event.x - self.compass_cx
+        dy = event.y - self.compass_cy
+        distance = math.sqrt(dx * dx + dy * dy)
+
+        outer_ring_inner = self.compass_radius * (2.0 / 3.0)
+        outer_ring_outer = self.compass_radius + 12
+
+        # Only accept clicks in the outer third of the compass ring.
+        if not (outer_ring_inner <= distance <= outer_ring_outer):
+            return
+
+        angle = (math.degrees(math.atan2(dy, dx)) + 90.0) % 360.0
+        self.goto_angle_direct(angle)
         
     def draw_compass(self):
         self.canvas.delete("all")
         
-        cx, cy = 200, 200  # Center point
-        radius = 160  # Radius
+        cx, cy = self.compass_cx, self.compass_cy  # Center point
+        radius = self.compass_radius  # Radius
         
         # White/light background circle
         self.canvas.create_oval(cx-radius-10, cy-radius-10, 
