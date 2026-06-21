@@ -5,7 +5,7 @@
 
 // Motor Configuration
 const int STEPS_PER_REV = 200;
-const int GEAR_RATIO = 50;
+const int GEAR_RATIO = 50 * 78/ 13; // 50:1 gearbox with 78/13 final drive reduction
 const int MICROSTEPS = 10;
 const long DEFAULT_TOTAL_STEPS = (long)STEPS_PER_REV * MICROSTEPS * GEAR_RATIO;
 
@@ -59,6 +59,8 @@ unsigned long lastPositionSave = 0;
 const unsigned long positionSaveInterval = 5000;
 const unsigned long positionIdleForceSaveInterval = 30000;
 unsigned long lastMotionForPositionSave = 0;
+bool pendingPositionSave = false;
+long pendingPositionSteps = 0;
 
 // External drive-disable pin control (active HIGH disables, LOW enables)
 const unsigned long driveEnableSettleMs = 500;
@@ -204,10 +206,23 @@ void loop() {
   if (millis() - lastPositionSave >= positionSaveInterval) {
     long currentPos = stepper->getCurrentPosition();
     if (abs(currentPos - lastSavedPosition) >= POSITION_SAVE_THRESHOLD) {
-      savePositionToEEPROM(currentPos);
-      lastSavedPosition = currentPos;
+      if (isPanning || stepper->isRunning()) {
+        // Defer flash writes while moving to avoid periodic motion stutter.
+        pendingPositionSave = true;
+        pendingPositionSteps = currentPos;
+      } else {
+        savePositionToEEPROM(currentPos);
+        lastSavedPosition = currentPos;
+      }
     }
     lastPositionSave = millis();
+  }
+
+  // Flush deferred position save once motion is idle.
+  if (pendingPositionSave && !isPanning && !stepper->isRunning()) {
+    savePositionToEEPROM(pendingPositionSteps);
+    lastSavedPosition = pendingPositionSteps;
+    pendingPositionSave = false;
   }
 
   // Fallback save: if position changed and has been idle for a while, persist once.
@@ -716,6 +731,7 @@ void forceSaveAll() {
   lastSavedSpeed = currentMaxSpeed;
   lastSavedAccel = currentAccel;
   lastSavedStepsPerRevolution = currentStepsPerRevolution;
+  pendingPositionSave = false;
 
   ROTATOR_SERIAL.println(F("SAVED"));
 }
@@ -736,6 +752,7 @@ void resetEEPROM() {
   lastSavedAccel = DEFAULT_ACCEL;
   lastSavedStepsPerRevolution = DEFAULT_TOTAL_STEPS;
   lastSavedPosition = 0;
+  pendingPositionSave = false;
 
   // Write defaults to EEPROM with valid magic number
   EEPROM.put(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);

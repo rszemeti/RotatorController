@@ -1,5 +1,6 @@
 {
-  "last_port": "COM4",
+  "last_port": "COM3",
   "my_locator": "",
-  "stations": []
+  "stations": [],
+  "steps_per_rev": 600000
 }

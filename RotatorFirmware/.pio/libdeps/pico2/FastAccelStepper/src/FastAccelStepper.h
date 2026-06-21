@@ -1,195 +1,12 @@
 #ifndef FASTACCELSTEPPER_H
 #define FASTACCELSTEPPER_H
 #include <stdint.h>
-#include "PoorManFloat.h"
 #include "fas_arch/common.h"
+#include "FastAccelStepperEngine.h"
 
-// # FastAccelStepper
-//
-// FastAccelStepper is a high speed alternative for the
-// [AccelStepper library](http://www.airspayce.com/mikem/arduino/AccelStepper/).
-// Supported are avr (ATmega 168/328/P, ATmega2560), esp32 and atmelsam due.
-//
-// Here is a basic example to run a stepper from position 0 to 1000 and back
-// again to 0.
-// ```
-// #include <FastAccelStepper.h>
-//
-// FastAccelStepperEngine engine = FastAccelStepperEngine();
-// FastAccelStepper *stepper = NULL;
-//
-// #define dirPinStepper    5
-// #define enablePinStepper 6
-// #define stepPinStepper   9
-// void setup() {
-//    engine.init();
-//    stepper = engine.stepperConnectToPin(stepPinStepper);
-//    if (stepper) {
-//       stepper->setDirectionPin(dirPinStepper);
-//       stepper->setEnablePin(enablePinStepper);
-//       stepper->setAutoEnable(true);
-//
-//       stepper->setSpeedInHz(500);
-//       stepper->setAcceleration(100);
-//       stepper->moveTo(1000, true);
-//       stepper->moveTo(0, true);
-//    }
-// }
-//
-// void loop() {}
-// ```
+enum class ExtDirPendingState : uint8_t { None = 0xff, Low = 0, High = 1 };
 
 class FastAccelStepper;
-
-class FastAccelStepperEngine {
-  //
-  // ## FastAccelStepperEngine
-  //
-  // This engine - actually a factory - provides you with instances of steppers.
-
- public:
-  // ### Initialization
-  //
-  // The FastAccelStepperEngine is declared with FastAccelStepperEngine().
-  // This is to occupy the needed memory.
-  // ```cpp
-  // FastAccelStepperEngine engine = FastAccelStepperEngine();
-  // ```
-  // But it still needs to be initialized.
-  // For this init shall be used:
-  // ```cpp
-  // void setup() {
-  //    engine.init();
-  // }
-  // ```
-
-#if defined(SUPPORT_CPU_AFFINITY)
-  // In a multitasking and multicore system like ESP32, the steppers are
-  // controlled by a continuously running task. This task can be fixed to one
-  // CPU core with this modified init()-call. ESP32 implementation detail: For
-  // values 0 and 1, xTaskCreatePinnedToCore() is used, or else xTaskCreate()
-  void init(uint8_t cpu_core = 255);
-#else
-  void init();
-#endif
-
-  // ### Creation of FastAccelStepper
-  //
-  // Using a call to `stepperConnectToPin()` a FastAccelStepper instance is
-  // created. This call tells the stepper, which step pin to use. As the
-  // hardware may have limitations - e.g. no stepper resources anymore, or the
-  // step pin cannot be used, then NULL is returned. So it is advised to check
-  // the return value of this call.
-#if !defined(SUPPORT_SELECT_DRIVER_TYPE)
-  FastAccelStepper* stepperConnectToPin(uint8_t step_pin);
-#endif
-  // For e.g. esp32, there are two types of driver.
-  // One using mcpwm and pcnt module. And another using rmt module.
-  // This call allows to select the respective driver
-#if defined(SUPPORT_SELECT_DRIVER_TYPE)
-#define DRIVER_MCPWM_PCNT 0
-#define DRIVER_RMT 1
-#define DRIVER_DONT_CARE 2
-  FastAccelStepper* stepperConnectToPin(uint8_t step_pin,
-                                        uint8_t driver_type = DRIVER_DONT_CARE);
-#endif
-
-#if defined(SUPPORT_TASK_RATE_CHANGE)
-  // For e.g. esp32 the repetition rate of the stepper task can be changed.
-  // The default delay is 4ms.
-  //
-  // The steppertask is looping with:
-  //       manageSteppers()
-  //       wdt_reset()
-  //       delay()
-  //
-  // The actual repetition rate of the stepper task is delay + execution time of
-  // manageSteppers()
-  //
-  // This function is primary of interest in conjunction with
-  // setForwardPlanningTimeInMs(). If the delay is larger then forward planning
-  // time, then the stepper queue will always run out of commands, which lead to
-  // a sudden stop of the motor. If the delay is 0, then the stepper task will
-  // constantly looping, which may lead to the task blocking other tasks.
-  // Consequently, this function is intended for advanced users.
-  //
-  // There is not planned to test this functionality, because automatic testing
-  // is only available for avr devices and those continue to use fixed 4ms rate.
-  //
-  // Please be aware, that the configured tick rate aka portTICK_PERIOD_MS is
-  // relevant. Apparently, arduino-esp32 has FreeRTOS configured to have a
-  // tick-rate of 1000Hz
-  inline void task_rate(uint8_t delay_ms) { _delay_ms = delay_ms; };
-  uint8_t _delay_ms;
-#endif
-
-  // Comments to valid pins:
-  //
-  // clang-format off
-  // | Device          | Comment                                                                                           |
-  // |:----------------|:--------------------------------------------------------------------------------------------------|
-  // | ESP32           | Every output capable GPIO can be used                                                             |
-  // | ESP32S2         | Every output capable GPIO can be used                                                             |
-  // | Atmega168/328/p | Only the pins connected to OC1A and OC1B are allowed                                              |
-  // | Atmega2560      | Only the pins connected to OC4A, OC4B and OC4C are allowed.                                       |
-  // | Atmega32u4      | Only the pins connected to OC1A, OC1B and OC1C are allowed                                        |
-  // | Atmel SAM       | This can be one of each group of pins: 34/67/74/35, 17/36/72/37/42, 40/64/69/41, 9, 8/44, 7/45, 6 |
-  // clang-format on
-
-  // ## External Pins
-  //
-  // If the direction/enable pins are e.g. connected via external HW (shift
-  // registers), then an external callback function can be supplied. The
-  // supplied value is either LOW or HIGH. The return value shall be the status
-  // of the pin (false for LOW or true for HIGH). If returned value and supplied
-  // value do not match, the stepper does not continue, but calls this function
-  // again.
-  //
-  // This function is called from cyclic task/interrupt with 4ms rate, which
-  // creates the commands to put into the command queue. Thus the supplied
-  // function should take much less time than 4ms. Otherwise there is risk, that
-  // other running steppers are running out of commands in the queue. If this
-  // takes longer, then the function should be offloaded and return the new
-  // status, after the pin change has been successfully completed.
-  //
-  // The callback has to be called on the FastAccelStepperEngine.
-  // See examples/ExternalCall
-  //
-  // Stepperpins (enable or direction), which should use this external callback,
-  // need to be or'ed with PIN_EXTERNAL_FLAG ! FastAccelStepper uses this flag
-  // to determine, if a pin is external or internal.
-  void setExternalCallForPin(bool (*func)(uint8_t pin, uint8_t value));
-
-  // ### Debug LED
-  //
-  // If blinking of a LED is required to indicate, the stepper controller is
-  // still running, then the port. to which the LED is connected, can be told to
-  // the engine. The periodic task will let the associated LED blink with 1 Hz
-  void setDebugLed(uint8_t ledPin);
-
-  /* This should be only called from ISR or stepper task. So do not call it */
-  void manageSteppers();
-
- private:
-  bool isDirPinBusy(uint8_t dirPin, uint8_t except_stepper);
-
-  uint8_t _stepper_cnt;
-  FastAccelStepper* _stepper[MAX_STEPPER];
-
-  bool _isValidStepPin(uint8_t step_pin);
-  bool (*_externalCallForPin)(uint8_t pin, uint8_t value);
-
-#if defined(SUPPORT_RP_PICO)
-  uint8_t claimed_pios;
-  PIO pio[NUM_PIOS];
-
- public:
-  void pushCommands();
-#endif
-
-  friend class FastAccelStepper;
-  friend class StepperQueue;
-};
 
 // ### Return codes of calls to `move()` and `moveTo()`
 //
@@ -229,7 +46,7 @@ class FastAccelStepperEngine {
 // and until the stepper task is serviced. The stepper task will then
 // control the direction flags
 
-#include "RampGenerator.h"
+#include "fas_ramp/RampGenerator.h"
 
 //
 // ## Timing values - Architecture dependent
@@ -271,12 +88,12 @@ class FastAccelStepper {
 #else
  private:
 #endif
-  bool init(FastAccelStepperEngine* engine, uint8_t num, uint8_t step_pin);
+  void init(FastAccelStepperEngine* engine, uint8_t num, uint8_t step_pin);
 
  public:
   // ## Step Pin
   // step pin is defined at creation. Here can retrieve the pin
-  uint8_t getStepPin();
+  uint8_t getStepPin() const;
 
   // ## Direction Pin
   // if direction pin is connected, call this function.
@@ -297,8 +114,8 @@ class FastAccelStepper {
   // in the range of ms or more.
   void setDirectionPin(uint8_t dirPin, bool dirHighCountsUp = true,
                        uint16_t dir_change_delay_us = 0);
-  inline uint8_t getDirectionPin() { return _dirPin; }
-  inline bool directionPinHighCountsUp() { return _dirHighCountsUp; }
+  inline uint8_t getDirectionPin() const { return _dirPin; }
+  inline bool directionPinHighCountsUp() const { return _dirHighCountsUp; }
 
   // ## Enable Pin
   // if enable pin is connected, then use this function.
@@ -313,8 +130,8 @@ class FastAccelStepper {
   //    setEnablePin(pin2, false);
   // If pin1 and pin2 are same, then the last call will be used.
   void setEnablePin(uint8_t enablePin, bool low_active_enables_stepper = true);
-  inline uint8_t getEnablePinHighActive() { return _enablePinHighActive; }
-  inline uint8_t getEnablePinLowActive() { return _enablePinLowActive; }
+  inline uint8_t getEnablePinHighActive() const { return _enablePinHighActive; }
+  inline uint8_t getEnablePinLowActive() const { return _enablePinLowActive; }
 
   // using enableOutputs/disableOutputs the stepper can be enabled and disabled
   // For a running motor with autoEnable set, disableOutputs() will return false
@@ -324,17 +141,20 @@ class FastAccelStepper {
   // In auto enable mode, the stepper is enabled before stepping and disabled
   // afterwards. The delay from stepper enabled till first step and from
   // last step to stepper disabled can be separately adjusted.
-  // The delay from enable to first step is done in ticks and as such is limited
-  // to MAX_ON_DELAY_TICKS, which translates approximately to 120ms for
-  // esp32 and 60ms for avr at 16 MHz). The delay till disable is done in period
-  // interrupt/task with 4 or 10 ms repetition rate and as such is with several
-  // ms jitter.
+  //
+  // setDelayToEnable() sets the delay from enable to first step.
+  // Return values:
+  //   - DelayResultCode::OK:       Delay accepted
+  //   - DelayResultCode::TOO_LOW:  Delay is 0 (minimum is 1µs)
+  //   - DelayResultCode::TOO_HIGH: Delay exceeds MAX_ON_DELAY_TICKS
+  //                                (~120ms ESP32, ~60ms AVR @ 16MHz)
+  //
+  // setDelayToDisable() sets the delay from last step to disable.
+  // This is executed in the periodic stepper task (~4-10ms rate) and thus
+  // has several ms of jitter.
   void setAutoEnable(bool auto_enable);
-  int8_t setDelayToEnable(uint32_t delay_us);
+  DelayResultCode setDelayToEnable(uint32_t delay_us);
   void setDelayToDisable(uint16_t delay_ms);
-#define DELAY_OK 0
-#define DELAY_TOO_LOW -1
-#define DELAY_TOO_HIGH -2
 
   // ## Stepper Position
   // Retrieve the current position of the stepper
@@ -343,7 +163,7 @@ class FastAccelStepper {
   // The actual position may be off by the number of steps in the ongoing
   // command. If precise real time position is needed, attaching a pulse counter
   // may be of help.
-  int32_t getCurrentPosition();
+  int32_t getCurrentPosition() const;
 
   // Set the current position of the stepper - either in standstill or while
   // moving.
@@ -354,7 +174,7 @@ class FastAccelStepper {
 
   // ## Stepper running status
   // is true while the stepper is running or ramp generation is active
-  bool isRunning();
+  bool isRunning() const;
 
   // ## Speed
   // For stepper movement control by FastAccelStepper's ramp generator
@@ -365,16 +185,16 @@ class FastAccelStepper {
   // - In us: This means in us/step
   //
   // For the device's maximum allowed speed, the following calls can be used.
-  uint16_t getMaxSpeedInUs();
-  uint16_t getMaxSpeedInTicks();
-  uint32_t getMaxSpeedInHz();
-  uint32_t getMaxSpeedInMilliHz();
+  uint16_t getMaxSpeedInUs() const;
+  uint16_t getMaxSpeedInTicks() const;
+  uint32_t getMaxSpeedInHz() const;
+  uint32_t getMaxSpeedInMilliHz() const;
 
   // For esp32 and avr, the device's maximum allowed speed can be overridden.
   // Allocating a new stepper will override any absolute speed limit.
   // This is absolutely untested, no error checking implemented.
   // Use at your own risk !
-#if SUPPORT_UNSAFE_ABS_SPEED_LIMIT_SETTING == 1
+#if defined(SUPPORT_UNSAFE_ABS_SPEED_LIMIT_SETTING)
   void setAbsoluteSpeedLimit(uint16_t max_speed_in_ticks);
 #endif
 
@@ -399,9 +219,9 @@ class FastAccelStepper {
 
   // To retrieve current set speed. This means, while accelerating and/or
   // decelerating, this is NOT the actual speed !
-  inline uint32_t getSpeedInUs() { return _rg.getSpeedInUs(); }
-  inline uint32_t getSpeedInTicks() { return _rg.getSpeedInTicks(); }
-  inline uint32_t getSpeedInMilliHz() { return _rg.getSpeedInMilliHz(); }
+  inline uint32_t getSpeedInUs() const { return _rg.getSpeedInUs(); }
+  inline uint32_t getSpeedInTicks() const { return _rg.getSpeedInTicks(); }
+  inline uint32_t getSpeedInMilliHz() const { return _rg.getSpeedInMilliHz(); }
 
   // If the current speed is needed, then use `getCurrentSpeed...()`. This
   // retrieves the actual speed.
@@ -425,8 +245,8 @@ class FastAccelStepper {
   // acceleration/deceleration.
   //
   // For backward compatibility, the default is true.
-  int32_t getCurrentSpeedInUs(bool realtime = true);
-  int32_t getCurrentSpeedInMilliHz(bool realtime = true);
+  int32_t getCurrentSpeedInUs(bool realtime = true) const;
+  int32_t getCurrentSpeedInMilliHz(bool realtime = true) const;
 
   // ## Acceleration
   //  setAcceleration() expects as parameter the change of speed
@@ -443,13 +263,13 @@ class FastAccelStepper {
   inline int8_t setAcceleration(int32_t step_s_s) {
     return _rg.setAcceleration(step_s_s);
   }
-  inline uint32_t getAcceleration() { return _rg.getAcceleration(); }
+  inline uint32_t getAcceleration() const { return _rg.getAcceleration(); }
 
   // getCurrentAcceleration() retrieves the actual acceleration.
   //    = 0 while idle or coasting
   //    > 0 while speed is changing towards positive values
-  //    < 0 while speed is changeing towards negative values
-  inline int32_t getCurrentAcceleration() {
+  //    < 0 while speed is changing towards negative values
+  inline int32_t getCurrentAcceleration() const {
     return _rg.getCurrentAcceleration();
   }
 
@@ -507,8 +327,8 @@ class FastAccelStepper {
   // move/moveTo for an ongoing command would reverse the direction, then the
   // command is silently ignored.
   // return values are the MOVE_... constants
-  int8_t move(int32_t move, bool blocking = false);
-  int8_t moveTo(int32_t position, bool blocking = false);
+  MoveResultCode move(int32_t move, bool blocking = false);
+  MoveResultCode moveTo(int32_t position, bool blocking = false);
 
   // ### keepRunning()
   // This command flags the stepper to keep run continuously into current
@@ -517,14 +337,14 @@ class FastAccelStepper {
   // direction, then keepRunning() will speed up again and not finish direction
   // reversal first.
   void keepRunning();
-  bool isRunningContinuously() { return _rg.isRunningContinuously(); }
+  bool isRunningContinuously() const { return _rg.isRunningContinuously(); }
 
   // ### runForward() and runBackwards()
   // These commands just let the motor run continuously in one direction.
   // If the motor is running in the opposite direction, it will reverse
   // return value as with move/moveTo
-  int8_t runForward();
-  int8_t runBackward();
+  MoveResultCode runForward();
+  MoveResultCode runBackward();
 
   // ### forwardStep() and backwardStep()
   // forwardStep()/backwardstep() can be called, while stepper is not moving
@@ -546,13 +366,14 @@ class FastAccelStepper {
   //        => accelerate towards negative maximum speed if allow_reverse
   //        => decelerate towards motor stop if allow_reverse = false
   // return value as with move/moveTo
-  int8_t moveByAcceleration(int32_t acceleration, bool allow_reverse = true);
+  MoveResultCode moveByAcceleration(int32_t acceleration,
+                                    bool allow_reverse = true);
 
   // ### stopMove()
   // Stop the running stepper with normal deceleration.
   // This only sets a flag and can be called from an interrupt !
   void stopMove();
-  inline bool isStopping() { return _rg.isStopping(); }
+  inline bool isStopping() const { return _rg.isStopping(); }
 
   // ### stepsToStop()
   // This returns the current step value of the ramp.
@@ -566,7 +387,7 @@ class FastAccelStepper {
   // The stop position is:
   //    getCurrentPosition() + stepsToStop()
   // in case of a motor running in positive direction.
-  uint32_t stepsToStop() { return _rg.stepsToStop(); }
+  uint32_t stepsToStop() const { return _rg.stepsToStop(); }
 
   // ### forceStop()
   // Abruptly stop the running stepper without deceleration.
@@ -591,7 +412,7 @@ class FastAccelStepper {
   // This means, the value will stay unchanged after a move/moveTo until the
   // stepper task is executed.
   // In keep running mode, the targetPos() is not updated
-  inline int32_t targetPos() { return _rg.targetPosition(); }
+  inline int32_t targetPos() const { return _rg.targetPosition(); }
 
   // ### Task planning
   // The stepper task adds commands to the stepper queue until
@@ -626,56 +447,58 @@ class FastAccelStepper {
     _forward_planning_in_ticks *= TICKS_PER_S / 1000;  // ticks per ms
   }
 
-// ## Intermediate Level Stepper Control for Advanced Users
-//
-// The main purpose is to bypass the ramp generator as mentioned in
-// [#299](https://github.com/gin66/FastAccelStepper/issues/299).
-// This shall allow to run consecutive small moves with fixed speed.
-// The parameters are steps (which can be 0) and duration in ticks.
-// steps=0 makes sense in order to keep the time running and not
-// getting out of sync.
-// Due to integer arithmetics the actual duration may be off by a small value.
-// That's why the actual_duration in TICKS is returned.
-// The application should consider this for the next runTimed move.
-//
-// The optional parameter is a boolean called start. This allows for the first
-// invocation to not start the queue yet. This is for managing steppers in
-// parallel. It allows to fill all steppers' queues and then kick it off by a
-// call to `moveTimed(0,0,NULL,true)`. Successive invocations can keep true.
-//
-// In order to not have another lightweight ramp generator running in
-// background interrupt, the expecation to the application is, that this
-// function is frequently enough called without the queue being emptied.
-//
-// The current implementation immediately starts with a step, if there should be
-// one. Perhaps performing the step in the middle of the duration is more
-// appropriate ?
-//
-// Meaning of the return values - which are in addtion to AQE from below
-// - OK:        Move has been successfully appended to the queue
-// - BUSY:      Queue does not have sufficient entries to append this timed
-// move.
-// - EMPTY:     The queue has run out of commands, but the move has been
-// appended.
-// - TOO_LARGE: The move request does not fit into the queue.
-//              Reasons: The queue depth is (32/16) for SAM+ESP32/AVR.
-//                       Each queue entry can emit 255 steps => (8160/4080)
-//                       steps If the time between steps is >65535 ticks, then
-//                       pauses have to be generated. In this case only (16/8)
-//                       steps can be generated...but the queue shall not be
-//                       empty
-//                       => so even less steps can be done.
-//              Recommendation: keep the duration in the range of ms.
-#define MOVE_TIMED_OK ((int8_t)0)
-#define MOVE_TIMED_BUSY ((int8_t)5)
-#define MOVE_TIMED_EMPTY ((int8_t)6)
-#define MOVE_TIMED_TOO_LARGE_ERROR ((int8_t)-4)
-  int8_t moveTimed(int16_t steps, uint32_t duration, uint32_t* actual_duration,
-                   bool start = true);
+  // ## Intermediate Level Stepper Control for Advanced Users
+  //
+  // The main purpose is to bypass the ramp generator as mentioned in
+  // [#299](https://github.com/gin66/FastAccelStepper/issues/299).
+  // This shall allow to run consecutive small moves with fixed speed.
+  // The parameters are steps (which can be 0) and duration in ticks.
+  // steps=0 makes sense in order to keep the time running and not
+  // getting out of sync.
+  // Due to integer arithmetics the actual duration may be off by a small value.
+  // That's why the actual_duration in TICKS is returned.
+  // The application should consider this for the next runTimed move.
+  //
+  // The optional parameter is a boolean called start. This allows for the first
+  // invocation to not start the queue yet. This is for managing steppers in
+  // parallel. It allows to fill all steppers' queues and then kick it off by a
+  // call to `moveTimed(0,0,NULL,true)`. Successive invocations can keep true.
+  //
+  // In order to not have another lightweight ramp generator running in
+  // background interrupt, the expecation to the application is, that this
+  // function is frequently enough called without the queue being emptied.
+  //
+  // The current implementation immediately starts with a step, if there should
+  // be one. Perhaps performing the step in the middle of the duration is more
+  // appropriate ?
+  //
+  // ### MoveTimedResultCode - Return codes for moveTimed()
+  //
+  // This enum extends AqeResultCode with additional codes:
+  //
+  // Positive values (retry later):
+  // - MOVE_TIMED_BUSY (5):      Queue too full to append this timed move
+  // - MOVE_TIMED_EMPTY (6):     Queue ran empty, but move was appended
+  // - (plus AQE_QUEUE_FULL, AQE_DIR_PIN_IS_BUSY,
+  // AQE_WAIT_FOR_ENABLE_PIN_ACTIVE,
+  //    AQE_DEVICE_NOT_READY from AqeResultCode)
+  //
+  // Zero:
+  // - MOVE_TIMED_OK (0):        Move successfully appended
+  //
+  // Negative values (errors):
+  // - MOVE_TIMED_TOO_LARGE_ERROR (-4): Move exceeds queue capacity.
+  //   Queue depth is 32 (ESP32/SAM) or 16 (AVR). Each entry emits max 255
+  //   steps. For slow speeds (>65535 ticks/step), pauses are needed, reducing
+  //   capacity. Recommendation: keep duration in the range of milliseconds.
+  // - (plus AQE_ERROR_TICKS_TOO_LOW, AQE_ERROR_EMPTY_QUEUE_TO_START,
+  //    AQE_ERROR_NO_DIR_PIN_TO_TOGGLE from AqeResultCode)
+  MoveTimedResultCode moveTimed(int16_t steps, uint32_t duration,
+                                uint32_t* actual_duration, bool start = true);
 
   // ## Low Level Stepper Queue Management (low level access)
   //
-  // If the queue is already running, then the start parameter is obsolote.
+  // If the queue is already running, then the start parameter is obsolete.
   // But the queue may run out of commands while executing addQueueEntry,
   // so it is better to set start=true to automatically restart/continue
   // a running queue.
@@ -689,23 +512,73 @@ class FastAccelStepper {
   // should be called with interrupts disabled and return very fast.
   // Actually this is necessary, too, in case the queue is full and not
   // started.
-  int8_t addQueueEntry(const struct stepper_command_s* cmd, bool start = true);
-
-  // Return codes for addQueueEntry
-  //    positive values mean, that caller should retry later
-#define AQE_OK 0
-#define AQE_QUEUE_FULL 1
-#define AQE_DIR_PIN_IS_BUSY 2
-#define AQE_WAIT_FOR_ENABLE_PIN_ACTIVE 3
-#define AQE_DEVICE_NOT_READY 4
-#define AQE_ERROR_TICKS_TOO_LOW -1
-#define AQE_ERROR_EMPTY_QUEUE_TO_START -2
-#define AQE_ERROR_NO_DIR_PIN_TO_TOGGLE -3
+  // ### Direction Change Delay Enforcement
+  //
+  // If the new command's direction differs from the previous command,
+  // addQueueEntry() will automatically insert pause commands to ensure
+  // sufficient delay before the first step in the new direction:
+  //
+  // - For external direction pins (pin >= 128): The direction pin is controlled
+  //   via an external callback (e.g., to an I/O expander). To avoid steps in
+  //   the wrong direction, the queue must be empty of steps before the
+  //   direction change. If steps are present or the external callback is still
+  //   pending, a 2ms pause is inserted and AQE_DIR_PIN_2MS_PAUSE_ADDED is
+  //   returned. The caller should retry until the queue drains and the callback
+  //   completes.
+  //
+  // - For regular direction pins: If setDirectionPin() was called with
+  //   dir_change_delay_us > 0, a pause command of that duration is inserted
+  //   before the first step in the new direction.
+  //
+  // - For autoEnable mode: The enable-on delay is extended to at least
+  //   dir_change_delay_ticks if a direction change occurs.
+  //
+  // ### stepper_command_s structure
+  //
+  // This structure defines a low-level stepper motor command for
+  // addQueueEntry():
+  //
+  // - `ticks`: Number of ticks between each step. Must be >=
+  // getMaxSpeedInTicks().
+  //   There are TICKS_PER_S ticks per second (platform dependent).
+  //
+  // - `steps`: Number of steps to send. If 0, this is a pause command lasting
+  //   for `ticks` ticks.
+  //
+  // - `count_up`: Direction. True = direction pin HIGH, False = direction pin
+  // LOW.
+  //
+  // Constraint: `ticks * steps` must be >= MIN_CMD_TICKS.
+  //
+  // Example: ticks=TICKS_PER_S/1000, steps=3, count_up=true means:
+  // 1. Direction pin set to HIGH
+  // 2. One step is generated
+  // 3. Exactly 1ms after the first step, the second step
+  // 4. Exactly 1ms after the second step, the third step
+  // 5. The stepper waits for 1ms
+  // 6. The next command is processed
+  //
+  // ### AqeResultCode - Return codes for addQueueEntry()
+  //
+  // Positive values indicate the caller should retry later:
+  // - AQE_OK (0):              Command added successfully
+  // - AQE_QUEUE_FULL (1):      Queue is full, retry later
+  // - AQE_DIR_PIN_IS_BUSY (2): External dir pin change in progress, retry later
+  // - AQE_WAIT_FOR_ENABLE_PIN_ACTIVE (3): Waiting for enable delay, retry later
+  // - AQE_DEVICE_NOT_READY (4): Device not ready, retry later
+  //
+  // Negative values indicate errors (do not retry):
+  // - AQE_ERROR_TICKS_TOO_LOW (-1):        ticks < getMaxSpeedInTicks()
+  // - AQE_ERROR_EMPTY_QUEUE_TO_START (-2): Empty command with start=true, but
+  // queue empty
+  // - AQE_ERROR_NO_DIR_PIN_TO_TOGGLE (-3): count_up=false without direction pin
+  AqeResultCode addQueueEntry(const struct stepper_command_s* cmd,
+                              bool start = true);
 
   // ### check functions for command queue being empty, full or running.
-  bool isQueueEmpty();
-  bool isQueueFull();
-  bool isQueueRunning();
+  bool isQueueEmpty() const;
+  bool isQueueFull() const;
+  bool isQueueRunning() const;
 
   // ### functions to get the fill level of the queue
   //
@@ -713,20 +586,20 @@ class FastAccelStepper {
   // can be used. It sums up all ticks of the not yet processed commands.
   // For commands defining pauses, the summed up value is entry.ticks.
   // For commands with steps, the summed up value is entry.steps*entry.ticks
-  uint32_t ticksInQueue();
+  uint32_t ticksInQueue() const;
 
   // This function can be used to check, if the commands in the queue
   // will last for <min_ticks> ticks. This is again without the
   // currently processed command.
-  bool hasTicksInQueue(uint32_t min_ticks);
+  bool hasTicksInQueue(uint32_t min_ticks) const;
 
   // This function allows to check the number of commands in the queue.
   // This is including the currently processed command.
-  uint8_t queueEntries();
+  uint8_t queueEntries() const;
 
   // Get the future position of the stepper after all commands in queue are
   // completed
-  int32_t getPositionAfterCommandsCompleted();
+  int32_t getPositionAfterCommandsCompleted() const;
 
   // Get the future speed of the stepper after all commands in queue are
   // completed. This is in µs. Returns 0 for stopped motor
@@ -734,8 +607,8 @@ class FastAccelStepper {
   // This value comes from the ramp generator and is not valid for raw command
   // queue
   // ==> Will be renamed in future release
-  uint32_t getPeriodInUsAfterCommandsCompleted();
-  uint32_t getPeriodInTicksAfterCommandsCompleted();
+  uint32_t getPeriodInUsAfterCommandsCompleted() const;
+  uint32_t getPeriodInTicksAfterCommandsCompleted() const;
 
   // Set the future position of the stepper after all commands in queue are
   // completed. This has immediate effect to getCurrentPosition().
@@ -744,10 +617,12 @@ class FastAccelStepper {
   // This function provides info, in which state the high level stepper control
   // is operating. The return value is an `or` of RAMP_STATE_... and
   // RAMP_DIRECTION_... flags. Definitions are above
-  inline uint8_t rampState() { return _rg.rampState(); }
+  inline uint8_t rampState() const { return _rg.rampState(); }
 
   // returns true, if the ramp generation is active
-  inline bool isRampGeneratorActive() { return _rg.isRampGeneratorActive(); }
+  inline bool isRampGeneratorActive() const {
+    return _rg.isRampGeneratorActive();
+  }
 
   // These functions allow to detach and reAttach a step pin for other use.
   // Pretty low level, use with care or not at all
@@ -814,18 +689,26 @@ class FastAccelStepper {
   inline bool pulseCounterAttached() { return _attached_pulse_cnt_unit >= 0; }
 #endif
 
+#if defined(SUPPORT_SELECT_DRIVER_TYPE)
+  // Get the driver type (RMT, MCPWM_PCNT, I2S_DIRECT, I2S_MUX) used by this
+  // stepper. Only available on ESP32 when multiple driver types are supported.
+  FasDriver driverType() const;
+  const char* driverTypeString() const;
+#endif
+
  private:
   void performOneStep(bool count_up, bool blocking = false);
-#ifdef SUPPORT_EXTERNAL_DIRECTION_PIN
-  bool externalDirPinChangeCompletedIfNeeded();
-#endif
   void fill_queue();
   void updateAutoDisable();
   void blockingWaitForForceStopComplete();
   bool needAutoDisable();
   bool agreeWithAutoDisable();
   bool usesAutoEnablePin(uint8_t pin);
-  void getCurrentSpeedInTicks(struct actual_ticks_s* speed, bool realtime);
+  void getCurrentSpeedInTicks(struct actual_ticks_s* speed,
+                              bool realtime) const;
+  bool handleExternalDirectionPin(class StepperQueue* q, bool count_up);
+  class StepperQueue* _queue() const;
+  bool setEnablePinState(uint8_t pin, uint8_t active_state);
 
   FastAccelStepperEngine* _engine;
   RampGenerator _rg;
@@ -843,6 +726,8 @@ class FastAccelStepper {
   uint16_t _auto_disable_delay_counter;
 
   uint32_t _forward_planning_in_ticks;
+
+  ExtDirPendingState _pendingExternalDirState;
 
 #if defined(SUPPORT_ESP32_PULSE_COUNTER) && (ESP_IDF_VERSION_MAJOR == 5)
   pcnt_unit_handle_t _attached_pulse_unit;

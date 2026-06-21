@@ -1,12 +1,9 @@
 #ifndef FAS_COMMON_H
 #define FAS_COMMON_H
 
-#define TICKS_FOR_STOPPED_MOTOR 0xffffffff
+#include "fas_arch/result_codes.h"
 
-#define MOVE_OK 0
-#define MOVE_ERR_NO_DIRECTION_PIN -1
-#define MOVE_ERR_SPEED_IS_UNDEFINED -2
-#define MOVE_ERR_ACCELERATION_IS_UNDEFINED -3
+#define TICKS_FOR_STOPPED_MOTOR 0xffffffff
 
 // Low level stepper motor command.
 //
@@ -48,9 +45,9 @@ struct actual_ticks_s {
 
 // I doubt, volatile is needed.
 struct queue_end_s {
-  volatile int32_t pos;  // in steps
-  volatile bool count_up;
-  volatile bool dir;
+  volatile int32_t pos;
+  bool count_up : 1;
+  bool dir : 1;
 };
 
 // use own min/max/abs function, because the lib versions are messed up
@@ -66,26 +63,36 @@ struct queue_end_s {
 #if defined(TEST)
 // TEST "architecture" is in use with pc_based testing.
 #include "fas_arch/test_pc.h"
+#include "pd_test/pd_config.h"
 
 #elif defined(ARDUINO_ARCH_ESP32)
 // ESP32 derivates using arduino core
 #include "fas_arch/arduino_esp32.h"
+#include "pd_esp32/pd_config.h"
 
 #elif defined(ESP_PLATFORM)
 // ESP32 derivates using espidf
 #include "fas_arch/espidf_esp32.h"
+#include "pd_esp32/pd_config.h"
 
 #elif defined(ARDUINO_ARCH_SAM)
 // SAM-architecture
 #include "fas_arch/arduino_sam.h"
+#include "pd_sam/pd_config.h"
 
 #elif defined(ARDUINO_ARCH_AVR)
 // AVR family
 #include "fas_arch/arduino_avr.h"
+#include "pd_avr/pd_config.h"
+
+#elif defined(PICO_SDK_RP2350)
+#include "fas_arch/pico_sdk_rp_pico.h"
+#include "pd_pico/pd_config.h"
 
 #elif defined(PICO_RP2040) || defined(PICO_RP2350)
 // Raspberry Pico and Pico 2
 #include "fas_arch/arduino_rp_pico.h"
+#include "pd_pico/pd_config.h"
 
 #else
 #error "Unsupported devices"

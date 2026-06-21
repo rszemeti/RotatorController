@@ -1,19 +1,19 @@
-#include "StepperISR.h"
+#include "fas_queue/stepper_queue.h"
 #if defined(SUPPORT_ESP32_PULSE_COUNTER) && (ESP_IDF_VERSION_MAJOR == 5)
 
 // Why the hell, does espressif think, that the unit and channel id are not
 // needed ? Without unit/channel ID, the needed parameter for
 // gpio_matrix_in/gpio_iomux_in cannot be derived.
 //
-// Here we declare the private pcnt_chan_t structure, which is not save.
+// Here we declare the private pcnt_chan_t structure, which is not safe.
 struct pcnt_unit_t {
-  /*pcnt_group_t*/ void *group;
+  /*pcnt_group_t*/ void* group;
   portMUX_TYPE spinlock;
   int unit_id;
   // remainder of struct not needed
 };
 struct pcnt_chan_t {
-  pcnt_unit_t *unit;
+  pcnt_unit_t* unit;
   int channel_id;
   // remainder of struct not needed
 };
