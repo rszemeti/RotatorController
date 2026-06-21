@@ -1,7 +1,31 @@
-// FastAccelStepper with Smart EEPROM Persistence
+// Dual-core rotator firmware
+// Core 0: comms, reporting, EEPROM persistence
+// Core 1: motion only (FastAccelStepper, drive enable)
+// Inter-core: rp2040.fifo for commands (Core0->Core1), volatile shared state (Core1->Core0)
 #include <Arduino.h>
 #include <FastAccelStepper.h>
 #include <EEPROM.h>
+
+// ============================================================
+// FIFO command words  (upper 4 bits = opcode, lower 28 = data)
+// ============================================================
+#define CMD_GOTO        0x10000000UL  // data = target steps (signed, cast)
+#define CMD_PAN         0x20000000UL  // data = 1 forward, 0xFF backward
+#define CMD_STOP        0x30000000UL
+#define CMD_FORCE_STOP  0x40000000UL
+#define CMD_SET_SPEED   0x50000000UL  // data = speed in Hz (integer)
+#define CMD_SET_ACCEL   0x60000000UL  // data = accel (integer)
+#define CMD_SET_POS     0x70000000UL  // data = new step position (signed, cast)
+#define CMD_OPCODE(w)   ((w) & 0xF0000000UL)
+#define CMD_DATA(w)     ((w) & 0x0FFFFFFFUL)
+#define CMD_SDATA(w)    ((int32_t)(((w) & 0x0FFFFFFFUL) << 4) >> 4) // sign-extend 28-bit
+
+// ============================================================
+// Shared state — written ONLY by Core 1, read by Core 0
+// ============================================================
+volatile long  sharedPosition   = 0;   // current stepper position
+volatile bool  sharedIsRunning  = false;
+volatile bool  sharedIsPanning  = false;
 
 // Motor Configuration
 const int STEPS_PER_REV = 200;
@@ -34,41 +58,44 @@ const float DEFAULT_SPEED = 4000.0;
 const float DEFAULT_ACCEL = 2000.0;
 const float PAN_CONSTANT_SPEED = 3000.0;
 
+// ============================================================
+// Core 1 — Motion globals (never touched by Core 0 after boot)
+// ============================================================
 FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepper = NULL;
 
-// Current settings
-float currentMaxSpeed = DEFAULT_SPEED;
-float currentAccel = DEFAULT_ACCEL;
-long currentStepsPerRevolution = DEFAULT_TOTAL_STEPS;
-float positionAngleOffsetDeg = 0.0;
+// Motion parameters — set from Core 0 via FIFO commands
+float  c1MaxSpeed  = DEFAULT_SPEED;
+float  c1Accel     = DEFAULT_ACCEL;
+bool   c1Panning   = false;
+int    c1PanDir    = 0;
+unsigned long c1LastPanCmd = 0;
+bool   c1HasTarget = false;
+long   c1TargetSteps = 0;
+bool   c1DriveEnabled = false;
+unsigned long c1LastMotionMs = 0;
+const unsigned long PAN_TIMEOUT         = 1000;
+const long          DEADBAND_STEPS      = 20;
+const unsigned long driveEnableSettleMs = 500;
+const unsigned long driveIdleDisableMs  = 10000;
 
-// Panning state
-bool isPanning = false;
-int panDirection = 0;
-unsigned long lastPanCommandTime = 0;
-const unsigned long PAN_TIMEOUT = 1000;
-bool hasActiveTarget = false;
-long activeTargetSteps = 0;
-const long ACTIVE_TARGET_DEADBAND_STEPS = 20;
+// ============================================================
+// Core 0 — Comms / persistence globals
+// ============================================================
+float currentMaxSpeed            = DEFAULT_SPEED;
+float currentAccel               = DEFAULT_ACCEL;
+long  currentStepsPerRevolution  = DEFAULT_TOTAL_STEPS;
+float positionAngleOffsetDeg     = 0.0;
 
-// Position update and save intervals
 unsigned long lastPositionUpdate = 0;
-const unsigned long positionUpdateInterval = 200;
-unsigned long lastPositionSave = 0;
-const unsigned long positionSaveInterval = 5000;
+const unsigned long positionUpdateInterval      = 200;
+unsigned long lastPositionSave   = 0;
+const unsigned long positionSaveInterval        = 5000;
 const unsigned long positionIdleForceSaveInterval = 30000;
 unsigned long lastMotionForPositionSave = 0;
-bool pendingPositionSave = false;
-long pendingPositionSteps = 0;
+bool  pendingPositionSave  = false;
+long  pendingPositionSteps = 0;
 
-// External drive-disable pin control (active HIGH disables, LOW enables)
-const unsigned long driveEnableSettleMs = 500;
-const unsigned long driveIdleDisableMs = 10000;
-bool driveEnabled = false;
-unsigned long lastMotionActivityMs = 0;
-
-// Heartbeat LED (1 Hz)
 const unsigned long heartbeatIntervalMs = 500;
 unsigned long lastHeartbeatToggle = 0;
 bool heartbeatState = false;
@@ -76,32 +103,46 @@ const int heartbeatFallbackPin = 25;
 const unsigned long usbStatusIntervalMs = 1000;
 unsigned long lastUsbStatus = 0;
 
-// Track what's been saved to avoid unnecessary writes
-long lastSavedPosition = 0;
-float lastSavedSpeed = 0;
-float lastSavedAccel = 0;
-long lastSavedStepsPerRevolution = DEFAULT_TOTAL_STEPS;
+long  lastSavedPosition           = 0;
+float lastSavedSpeed              = 0;
+float lastSavedAccel              = 0;
+long  lastSavedStepsPerRevolution = DEFAULT_TOTAL_STEPS;
 const long POSITION_SAVE_THRESHOLD = 50;
 
-// Forward declarations (required for .cpp builds)
+// ============================================================
+// Helpers shared by both cores (read-only constants / pure math)
+// ============================================================
+float normalizeAngleDeg(float angle) {
+  while (angle < 0)      angle += 360.0f;
+  while (angle >= 360.0f) angle -= 360.0f;
+  return angle;
+}
+
+float getCurrentAngle() {
+  // Uses sharedPosition (volatile, written by Core 1)
+  float rel = (float)sharedPosition * 360.0f / currentStepsPerRevolution;
+  return normalizeAngleDeg(rel + positionAngleOffsetDeg);
+}
+
+long calculateNearestTargetSteps(float targetAngle, long referencePos) {
+  float relTarget = normalizeAngleDeg(targetAngle - positionAngleOffsetDeg);
+  long  base      = (long)round((double)relTarget * (double)currentStepsPerRevolution / 360.0);
+  long  turn      = (long)round((double)(referencePos - base) / (double)currentStepsPerRevolution);
+  return base + turn * currentStepsPerRevolution;
+}
+
+// ============================================================
+// Core 0 forward declarations
+// ============================================================
 void processCommand(String command);
-void startPanning(int direction);
-void stopPanning();
 void goToAngle(float targetAngle);
 void setCurrentPosition(float angle);
 void setSpeed(float speed);
 void setAcceleration(float accel);
 void setStepsPerRevolution(long steps);
-long calculateNearestTargetSteps(float targetAngle, long referencePos);
-void updateActiveTargetControl();
-float normalizeAngleDeg(float angle);
 void printPosition();
 void printInfo();
-float getCurrentAngle();
 void loadFromEEPROM();
-void setDriveEnabled(bool enabled);
-void prepareDriveForMotion();
-void updateDriveIdleState();
 void savePositionToEEPROM(long position);
 void saveSpeedToEEPROM(float speed);
 void saveAccelToEEPROM(float accel);
@@ -110,132 +151,100 @@ void commitEEPROM();
 void forceSaveAll();
 void resetEEPROM();
 
+// ============================================================
+// CORE 0 — setup / loop  (comms, reporting, EEPROM)
+// ============================================================
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(heartbeatFallbackPin, OUTPUT);
-  pinMode(driveDisablePin, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
   digitalWrite(heartbeatFallbackPin, LOW);
-  setDriveEnabled(false);
 
   Serial.begin(usbBaudRate);
   unsigned long serialStart = millis();
-  while (!Serial && (millis() - serialStart < 2000)) {
-    delay(10);
-  }
-  if (Serial) {
-    Serial.println(F("BOOT OK"));
-  }
+  while (!Serial && (millis() - serialStart < 2000)) delay(10);
+  if (Serial) Serial.println(F("BOOT OK"));
 
   ROTATOR_SERIAL.setTX(serialTxPin);
   ROTATOR_SERIAL.setRX(serialRxPin);
   ROTATOR_SERIAL.begin(serialBaudRate);
 
   EEPROM.begin(EEPROM_SIZE_BYTES);
+  loadFromEEPROM();   // populates currentMaxSpeed, currentAccel, etc.
 
-  engine.init();
+  // Wait for Core 1 to signal ready via FIFO
+  rp2040.fifo.pop();  // blocks until Core 1 pushes 0xDEAD
 
-  stepper = engine.stepperConnectToPin(stepPin);
-  if (stepper) {
-    stepper->setDirectionPin(dirPin);
-    stepper->setAutoEnable(true);
+  // Send initial parameters to Core 1
+  rp2040.fifo.push(CMD_SET_SPEED | (uint32_t)(int32_t)currentMaxSpeed);
+  rp2040.fifo.push(CMD_SET_ACCEL | (uint32_t)(int32_t)currentAccel);
 
-    // Load saved settings from EEPROM
-    loadFromEEPROM();
-
-    // Apply loaded settings
-    stepper->setSpeedInHz(currentMaxSpeed);
-    stepper->setAcceleration(currentAccel);
-
-    // Initialize "last saved" trackers
-    lastSavedSpeed = currentMaxSpeed;
-    lastSavedAccel = currentAccel;
-    lastSavedStepsPerRevolution = currentStepsPerRevolution;
-    lastSavedPosition = stepper->getCurrentPosition();
-
-    ROTATOR_SERIAL.println(F("=== Rotator Ready (Smart EEPROM) ==="));
-    ROTATOR_SERIAL.print(F("Loaded Steps/360: ")); ROTATOR_SERIAL.println(currentStepsPerRevolution);
-    ROTATOR_SERIAL.print(F("Loaded Position: ")); ROTATOR_SERIAL.print(getCurrentAngle(), 2); ROTATOR_SERIAL.println(F("°"));
-    ROTATOR_SERIAL.print(F("Loaded Speed: ")); ROTATOR_SERIAL.println(currentMaxSpeed, 0);
-    ROTATOR_SERIAL.print(F("Loaded Accel: ")); ROTATOR_SERIAL.println(currentAccel, 0);
-    ROTATOR_SERIAL.println(F("GUI Ready"));
-
-    printPosition();
-  } else {
-    ROTATOR_SERIAL.println(F("ERROR: Stepper init failed!"));
-  }
+  ROTATOR_SERIAL.println(F("=== Rotator Ready (Dual-Core) ==="));
+  ROTATOR_SERIAL.print(F("Loaded Steps/360: ")); ROTATOR_SERIAL.println(currentStepsPerRevolution);
+  ROTATOR_SERIAL.print(F("Loaded Position: ")); ROTATOR_SERIAL.print(getCurrentAngle(), 2); ROTATOR_SERIAL.println(F("°"));
+  ROTATOR_SERIAL.print(F("Loaded Speed: ")); ROTATOR_SERIAL.println(currentMaxSpeed, 0);
+  ROTATOR_SERIAL.print(F("Loaded Accel: ")); ROTATOR_SERIAL.println(currentAccel, 0);
+  ROTATOR_SERIAL.println(F("GUI Ready"));
+  printPosition();
 }
 
 void loop() {
+  // --- Heartbeat ---
   if (millis() - lastHeartbeatToggle >= heartbeatIntervalMs) {
     heartbeatState = !heartbeatState;
-    digitalWrite(LED_BUILTIN, heartbeatState ? HIGH : LOW);
+    digitalWrite(LED_BUILTIN,        heartbeatState ? HIGH : LOW);
     digitalWrite(heartbeatFallbackPin, heartbeatState ? HIGH : LOW);
     lastHeartbeatToggle = millis();
   }
 
+  // --- USB keepalive ---
   if (Serial && (millis() - lastUsbStatus >= usbStatusIntervalMs)) {
     Serial.println(F("ALIVE"));
     lastUsbStatus = millis();
   }
 
-  // Watchdog check
-  if (isPanning) {
-    if (millis() - lastPanCommandTime > PAN_TIMEOUT) {
-      stopPanning();
-    }
-  }
+  // --- Track motion activity (reads volatile) ---
+  bool moving = sharedIsRunning || sharedIsPanning;
+  if (moving) lastMotionForPositionSave = millis();
 
-  updateDriveIdleState();
-
-  updateActiveTargetControl();
-
-  if (isPanning || stepper->isRunning()) {
-    lastMotionForPositionSave = millis();
-  }
-
-  // Position updates
+  // --- Position reporting ---
   if (millis() - lastPositionUpdate >= positionUpdateInterval) {
-    if (isPanning || stepper->isRunning()) {
-      printPosition();
-    }
+    if (moving) printPosition();
     lastPositionUpdate = millis();
   }
 
-  // Periodic position save (only if changed significantly)
+  // --- Periodic position save (deferred until idle) ---
   if (millis() - lastPositionSave >= positionSaveInterval) {
-    long currentPos = stepper->getCurrentPosition();
-    if (abs(currentPos - lastSavedPosition) >= POSITION_SAVE_THRESHOLD) {
-      if (isPanning || stepper->isRunning()) {
-        // Defer flash writes while moving to avoid periodic motion stutter.
-        pendingPositionSave = true;
-        pendingPositionSteps = currentPos;
+    long pos = sharedPosition;
+    if (abs(pos - lastSavedPosition) >= POSITION_SAVE_THRESHOLD) {
+      if (moving) {
+        pendingPositionSave  = true;
+        pendingPositionSteps = pos;
       } else {
-        savePositionToEEPROM(currentPos);
-        lastSavedPosition = currentPos;
+        savePositionToEEPROM(pos);
+        lastSavedPosition = pos;
       }
     }
     lastPositionSave = millis();
   }
 
-  // Flush deferred position save once motion is idle.
-  if (pendingPositionSave && !isPanning && !stepper->isRunning()) {
+  // --- Flush deferred save once idle ---
+  if (pendingPositionSave && !moving) {
     savePositionToEEPROM(pendingPositionSteps);
-    lastSavedPosition = pendingPositionSteps;
-    pendingPositionSave = false;
+    lastSavedPosition    = pendingPositionSteps;
+    pendingPositionSave  = false;
   }
 
-  // Fallback save: if position changed and has been idle for a while, persist once.
-  if (!isPanning && !stepper->isRunning() &&
-      (millis() - lastMotionForPositionSave >= positionIdleForceSaveInterval)) {
-    long currentPos = stepper->getCurrentPosition();
-    if (currentPos != lastSavedPosition) {
-      savePositionToEEPROM(currentPos);
-      lastSavedPosition = currentPos;
+  // --- Idle force-save fallback ---
+  if (!moving && (millis() - lastMotionForPositionSave >= positionIdleForceSaveInterval)) {
+    long pos = sharedPosition;
+    if (pos != lastSavedPosition) {
+      savePositionToEEPROM(pos);
+      lastSavedPosition = pos;
     }
   }
 
-  // Process commands
+  // --- Serial command processing ---
   if (ROTATOR_SERIAL.available() > 0) {
     String command = ROTATOR_SERIAL.readStringUntil('\n');
     command.trim();
@@ -244,59 +253,170 @@ void loop() {
   }
 }
 
+// ============================================================
+// CORE 1 — setup1 / loop1  (motion only)
+// ============================================================
+void setup1() {
+  pinMode(driveDisablePin, OUTPUT);
+  digitalWrite(driveDisablePin, HIGH);  // drive disabled at boot
+
+  engine.init();
+  stepper = engine.stepperConnectToPin(stepPin);
+  if (stepper) {
+    stepper->setDirectionPin(dirPin);
+    stepper->setAutoEnable(true);
+    stepper->setSpeedInHz((uint32_t)c1MaxSpeed);
+    stepper->setAcceleration((uint32_t)c1Accel);
+  }
+
+  rp2040.fifo.push(0xDEAD);  // signal Core 0 we are ready
+}
+
+void loop1() {
+  // --- Process any pending FIFO commands from Core 0 ---
+  while (rp2040.fifo.available()) {
+    uint32_t cmd = rp2040.fifo.pop();
+    uint32_t op  = CMD_OPCODE(cmd);
+
+    if (op == CMD_GOTO) {
+      long target = (long)CMD_SDATA(cmd);
+      c1HasTarget   = true;
+      c1TargetSteps = target;
+      c1Panning     = false;
+      if (!c1DriveEnabled) {
+        digitalWrite(driveDisablePin, LOW);
+        c1DriveEnabled = true;
+        delay(driveEnableSettleMs);
+      }
+      c1LastMotionMs = millis();
+      stepper->setSpeedInHz((uint32_t)c1MaxSpeed);
+      stepper->moveTo(target);
+
+    } else if (op == CMD_PAN) {
+      c1HasTarget = false;
+      c1PanDir    = (CMD_DATA(cmd) == 1) ? 1 : -1;
+      c1Panning   = true;
+      c1LastPanCmd = millis();
+      if (!c1DriveEnabled) {
+        digitalWrite(driveDisablePin, LOW);
+        c1DriveEnabled = true;
+        delay(driveEnableSettleMs);
+      }
+      c1LastMotionMs = millis();
+      stepper->setSpeedInHz((uint32_t)PAN_CONSTANT_SPEED);
+      if (c1PanDir > 0) stepper->runForward();
+      else              stepper->runBackward();
+
+    } else if (op == CMD_STOP) {
+      c1Panning   = false;
+      c1HasTarget = false;
+      c1PanDir    = 0;
+      stepper->stopMove();
+      stepper->setSpeedInHz((uint32_t)c1MaxSpeed);
+
+    } else if (op == CMD_FORCE_STOP) {
+      c1Panning   = false;
+      c1HasTarget = false;
+      stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
+
+    } else if (op == CMD_SET_SPEED) {
+      c1MaxSpeed = (float)CMD_DATA(cmd);
+      if (!c1Panning) stepper->setSpeedInHz((uint32_t)c1MaxSpeed);
+
+    } else if (op == CMD_SET_ACCEL) {
+      c1Accel = (float)CMD_DATA(cmd);
+      stepper->setAcceleration((uint32_t)c1Accel);
+
+    } else if (op == CMD_SET_POS) {
+      stepper->setCurrentPosition((long)CMD_SDATA(cmd));
+      c1HasTarget = false;
+    }
+  }
+
+  // --- Pan watchdog ---
+  if (c1Panning && (millis() - c1LastPanCmd > PAN_TIMEOUT)) {
+    c1Panning = false;
+    c1PanDir  = 0;
+    stepper->stopMove();
+    stepper->setSpeedInHz((uint32_t)c1MaxSpeed);
+  }
+
+  // --- Active target re-trigger (if stepper stopped short) ---
+  if (c1HasTarget && !c1Panning && !stepper->isRunning()) {
+    long pos = stepper->getCurrentPosition();
+    if (abs(c1TargetSteps - pos) <= DEADBAND_STEPS) {
+      c1HasTarget = false;
+    } else {
+      stepper->moveTo(c1TargetSteps);
+    }
+  }
+
+  // --- Drive idle disable ---
+  bool running = stepper->isRunning() || c1Panning;
+  if (running) {
+    c1LastMotionMs = millis();
+  } else if (c1DriveEnabled && (millis() - c1LastMotionMs >= driveIdleDisableMs)) {
+    digitalWrite(driveDisablePin, HIGH);
+    c1DriveEnabled = false;
+  }
+
+  // --- Update shared state for Core 0 to read ---
+  sharedPosition  = stepper->getCurrentPosition();
+  sharedIsRunning = stepper->isRunning();
+  sharedIsPanning = c1Panning;
+}
+
+// ============================================================
+// CORE 0 — Command processing (pushes to FIFO, no stepper calls)
+// ============================================================
 void processCommand(String command) {
-  // Check AC BEFORE A (otherwise AC2000 gets parsed as A with "C2000")
   if (command.startsWith("AC")) {
     float accel = command.substring(2).toFloat();
     setAcceleration(accel);
   }
   else if (command.startsWith("A")) {
-    stopPanning();
     float angle = command.substring(1).toFloat();
+    rp2040.fifo.push(CMD_STOP);
     goToAngle(angle);
   }
   else if (command == "H") {
-    stopPanning();
+    rp2040.fifo.push(CMD_STOP);
     goToAngle(0);
   }
   else if (command == "P") {
     printPosition();
   }
   else if (command.startsWith("SETPOS")) {
-    stopPanning();
+    rp2040.fifo.push(CMD_STOP);
     float angle = command.substring(6).toFloat();
     setCurrentPosition(angle);
   }
   else if (command == "PANLEFT") {
-    if (isPanning && panDirection == -1) {
-      lastPanCommandTime = millis();
+    // Refresh pan watchdog if already panning left
+    if (sharedIsPanning) {
+      rp2040.fifo.push(CMD_PAN | 0xFF);  // 0xFF = backward
     } else {
-      startPanning(-1);
+      rp2040.fifo.push(CMD_PAN | 0xFF);
     }
+    ROTATOR_SERIAL.println(F("PAN:L"));
   }
   else if (command == "PANRIGHT") {
-    if (isPanning && panDirection == 1) {
-      lastPanCommandTime = millis();
-    } else {
-      startPanning(1);
-    }
+    rp2040.fifo.push(CMD_PAN | 1);
+    ROTATOR_SERIAL.println(F("PAN:R"));
   }
   else if (command == "PANSTOP") {
-    stopPanning();
+    rp2040.fifo.push(CMD_STOP);
+    ROTATOR_SERIAL.println(F("PANSTOP"));
   }
   else if (command == "STOP") {
-    stopPanning();
-    hasActiveTarget = false;
-    stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
-
-    // Save position immediately on emergency stop
-    long currentPos = stepper->getCurrentPosition();
-    if (currentPos != lastSavedPosition) {
-      savePositionToEEPROM(currentPos);
-      lastSavedPosition = currentPos;
+    rp2040.fifo.push(CMD_FORCE_STOP);
+    long pos = sharedPosition;
+    if (pos != lastSavedPosition) {
+      savePositionToEEPROM(pos);
+      lastSavedPosition = pos;
     }
+    ROTATOR_SERIAL.println(F("STOP"));
   }
-  // Check S but exclude SETPOS, STOP, and SAVE
   else if (command.startsWith("STEPS")) {
     long steps = command.substring(5).toInt();
     setStepsPerRevolution(steps);
@@ -310,6 +430,8 @@ void processCommand(String command) {
   }
   else if (command == "LOAD") {
     loadFromEEPROM();
+    rp2040.fifo.push(CMD_SET_SPEED | (uint32_t)(int32_t)currentMaxSpeed);
+    rp2040.fifo.push(CMD_SET_ACCEL | (uint32_t)(int32_t)currentAccel);
     ROTATOR_SERIAL.println(F("LOADED"));
     printPosition();
   }
@@ -321,274 +443,120 @@ void processCommand(String command) {
   }
 }
 
-
-void startPanning(int direction) {
-  hasActiveTarget = false;
-  prepareDriveForMotion();
-  isPanning = true;
-  panDirection = direction;
-  lastPanCommandTime = millis();
-
-  stepper->setSpeedInHz(PAN_CONSTANT_SPEED);
-
-  if (direction > 0) {
-    stepper->runForward();
-  } else {
-    stepper->runBackward();
-  }
-
-  ROTATOR_SERIAL.print(F("PAN:"));
-  ROTATOR_SERIAL.println(direction > 0 ? 'R' : 'L');
-}
-
-void stopPanning() {
-  if (isPanning) {
-    isPanning = false;
-    panDirection = 0;
-    stepper->stopMove();
-
-    stepper->setSpeedInHz(currentMaxSpeed);
-
-    // Save position after panning (only if changed)
-    long currentPos = stepper->getCurrentPosition();
-    if (abs(currentPos - lastSavedPosition) >= POSITION_SAVE_THRESHOLD) {
-      savePositionToEEPROM(currentPos);
-      lastSavedPosition = currentPos;
-    }
-  }
-}
-
 void goToAngle(float targetAngle) {
-  while (targetAngle < 0) targetAngle += 360.0;
-  while (targetAngle >= 360.0) targetAngle -= 360.0;
+  while (targetAngle < 0)       targetAngle += 360.0f;
+  while (targetAngle >= 360.0f) targetAngle -= 360.0f;
 
-  long currentPos = stepper->getCurrentPosition();
-  activeTargetSteps = calculateNearestTargetSteps(targetAngle, currentPos);
-  hasActiveTarget = true;
-  float currentAngle = getCurrentAngle();
-  long deltaSteps = activeTargetSteps - currentPos;
+  long currentPos = sharedPosition;
+  long target     = calculateNearestTargetSteps(targetAngle, currentPos);
+  long delta      = target - currentPos;
 
-  ROTATOR_SERIAL.print(F("GO:"));
-  ROTATOR_SERIAL.println(targetAngle, 1);
-  ROTATOR_SERIAL.print(F("GO DBG cur="));
-  ROTATOR_SERIAL.print(currentPos);
-  ROTATOR_SERIAL.print(F(" curAng="));
-  ROTATOR_SERIAL.print(currentAngle, 2);
-  ROTATOR_SERIAL.print(F(" dAng="));
-  ROTATOR_SERIAL.print(targetAngle - currentAngle, 2);
-  ROTATOR_SERIAL.print(F(" dStp="));
-  ROTATOR_SERIAL.print(deltaSteps);
-  ROTATOR_SERIAL.print(F(" tgt="));
-  ROTATOR_SERIAL.print(activeTargetSteps);
-  ROTATOR_SERIAL.print(F(" spr="));
-  ROTATOR_SERIAL.println(currentStepsPerRevolution);
+  ROTATOR_SERIAL.print(F("GO:")); ROTATOR_SERIAL.println(targetAngle, 1);
+  ROTATOR_SERIAL.print(F("GO DBG cur=")); ROTATOR_SERIAL.print(currentPos);
+  ROTATOR_SERIAL.print(F(" dStp="));     ROTATOR_SERIAL.print(delta);
+  ROTATOR_SERIAL.print(F(" tgt="));      ROTATOR_SERIAL.print(target);
+  ROTATOR_SERIAL.print(F(" spr="));      ROTATOR_SERIAL.println(currentStepsPerRevolution);
 
-  if (deltaSteps != 0) {
-    prepareDriveForMotion();
-    stepper->moveTo(activeTargetSteps);
-  }
-}
-
-long calculateNearestTargetSteps(float targetAngle, long referencePos) {
-  float relativeTargetAngle = normalizeAngleDeg(targetAngle - positionAngleOffsetDeg);
-  long targetStepsBase = (long)round((double)relativeTargetAngle * (double)currentStepsPerRevolution / 360.0);
-  long nearestTurn = (long)round((double)(referencePos - targetStepsBase) / (double)currentStepsPerRevolution);
-  return targetStepsBase + nearestTurn * currentStepsPerRevolution;
-}
-
-float normalizeAngleDeg(float angle) {
-  while (angle < 0) angle += 360.0;
-  while (angle >= 360.0) angle -= 360.0;
-  return angle;
-}
-
-void updateActiveTargetControl() {
-  if (!hasActiveTarget || isPanning) {
-    return;
-  }
-
-  long currentPos = stepper->getCurrentPosition();
-  if (abs(activeTargetSteps - currentPos) <= ACTIVE_TARGET_DEADBAND_STEPS) {
-    hasActiveTarget = false;
-    return;
-  }
-
-  if (!stepper->isRunning()) {
-    prepareDriveForMotion();
-    stepper->moveTo(activeTargetSteps);
-  }
-}
-
-void setDriveEnabled(bool enabled) {
-  pinMode(driveDisablePin, OUTPUT);
-  digitalWrite(driveDisablePin, enabled ? LOW : HIGH);
-  driveEnabled = enabled;
-}
-
-void prepareDriveForMotion() {
-  if (!driveEnabled) {
-    setDriveEnabled(true);
-    delay(driveEnableSettleMs);
-  }
-  lastMotionActivityMs = millis();
-}
-
-void updateDriveIdleState() {
-  if (isPanning || stepper->isRunning()) {
-    lastMotionActivityMs = millis();
-    return;
-  }
-
-  if (driveEnabled && (millis() - lastMotionActivityMs >= driveIdleDisableMs)) {
-    setDriveEnabled(false);
+  if (delta != 0) {
+    // Pack signed target into 28-bit payload
+    rp2040.fifo.push(CMD_GOTO | ((uint32_t)(int32_t)target & 0x0FFFFFFFUL));
   }
 }
 
 void setCurrentPosition(float angle) {
   angle = normalizeAngleDeg(angle);
+  long pos = sharedPosition;
+  float relAngle = (float)pos * 360.0f / currentStepsPerRevolution;
+  positionAngleOffsetDeg = normalizeAngleDeg(angle - relAngle);
 
-  long currentSteps = stepper->getCurrentPosition();
-  float relativeAngle = (float)currentSteps * 360.0 / currentStepsPerRevolution;
-  positionAngleOffsetDeg = normalizeAngleDeg(angle - relativeAngle);
-  hasActiveTarget = false;
+  savePositionToEEPROM(pos);
+  lastSavedPosition = pos;
 
-  // Always save immediately when position is manually set
-  savePositionToEEPROM(currentSteps);
-  lastSavedPosition = currentSteps;
-
-  ROTATOR_SERIAL.print(F("SET:"));
-  ROTATOR_SERIAL.println(angle, 1);
+  ROTATOR_SERIAL.print(F("SET:")); ROTATOR_SERIAL.println(angle, 1);
 }
 
 void setSpeed(float speed) {
-  if (speed < 100) {
-    ROTATOR_SERIAL.println(F("Speed too low, setting to 100"));
-    speed = 100;
-  }
-  if (speed > 50000) {
-    ROTATOR_SERIAL.println(F("Speed too high, limiting to 50000"));
-    speed = 50000;
-  }
+  if (speed < 100)   { ROTATOR_SERIAL.println(F("Speed too low, setting to 100"));  speed = 100; }
+  if (speed > 50000) { ROTATOR_SERIAL.println(F("Speed too high, limiting to 50000")); speed = 50000; }
 
   currentMaxSpeed = speed;
-  stepper->setSpeedInHz(speed);
+  rp2040.fifo.push(CMD_SET_SPEED | (uint32_t)(int32_t)speed);
 
-  // Only save if value actually changed
-  if (abs(speed - lastSavedSpeed) > 1.0) {
+  if (abs(speed - lastSavedSpeed) > 1.0f) {
     saveSpeedToEEPROM(speed);
     lastSavedSpeed = speed;
   }
-
-  ROTATOR_SERIAL.print(F("SPD:"));
-  ROTATOR_SERIAL.println(speed, 0);
+  ROTATOR_SERIAL.print(F("SPD:")); ROTATOR_SERIAL.println(speed, 0);
 }
 
 void setAcceleration(float accel) {
-  if (accel < 100) {
-    ROTATOR_SERIAL.println(F("Accel too low, setting to 100"));
-    accel = 100;
-  }
-  if (accel > 100000) {
-    ROTATOR_SERIAL.println(F("Accel too high, limiting to 100000"));
-    accel = 100000;
-  }
+  if (accel < 100)    { ROTATOR_SERIAL.println(F("Accel too low, setting to 100"));    accel = 100; }
+  if (accel > 100000) { ROTATOR_SERIAL.println(F("Accel too high, limiting to 100000")); accel = 100000; }
 
   currentAccel = accel;
-  stepper->setAcceleration(accel);
+  rp2040.fifo.push(CMD_SET_ACCEL | (uint32_t)(int32_t)accel);
 
-  // Only save if value actually changed
-  if (abs(accel - lastSavedAccel) > 1.0) {
+  if (abs(accel - lastSavedAccel) > 1.0f) {
     saveAccelToEEPROM(accel);
     lastSavedAccel = accel;
   }
-
-  ROTATOR_SERIAL.print(F("ACC:"));
-  ROTATOR_SERIAL.println(accel, 0);
+  ROTATOR_SERIAL.print(F("ACC:")); ROTATOR_SERIAL.println(accel, 0);
 }
 
 void setStepsPerRevolution(long steps) {
-  if (steps < 1000) {
-    ROTATOR_SERIAL.println(F("Steps/360 too low, setting to 1000"));
-    steps = 1000;
-  }
-  if (steps > 10000000) {
-    ROTATOR_SERIAL.println(F("Steps/360 too high, limiting to 10000000"));
-    steps = 10000000;
-  }
+  if (steps < 1000)     { ROTATOR_SERIAL.println(F("Steps/360 too low, setting to 1000"));    steps = 1000; }
+  if (steps > 10000000) { ROTATOR_SERIAL.println(F("Steps/360 too high, limiting to 10000000")); steps = 10000000; }
 
-  if (isPanning || stepper->isRunning()) {
+  if (sharedIsRunning || sharedIsPanning) {
     ROTATOR_SERIAL.println(F("Cannot change Steps/360 while moving"));
     return;
   }
-
-  long oldStepsPerRevolution = currentStepsPerRevolution;
-  if (steps == oldStepsPerRevolution) {
-    ROTATOR_SERIAL.print(F("STEPS:"));
-    ROTATOR_SERIAL.println(steps);
+  if (steps == currentStepsPerRevolution) {
+    ROTATOR_SERIAL.print(F("STEPS:")); ROTATOR_SERIAL.println(steps);
     return;
   }
 
-  long currentPos = stepper->getCurrentPosition();
-  float currentAngle = getCurrentAngle();
-  float relativeAngle = normalizeAngleDeg(currentAngle - positionAngleOffsetDeg);
+  long  pos        = sharedPosition;
+  float curAngle   = getCurrentAngle();
+  float relAngle   = normalizeAngleDeg(curAngle - positionAngleOffsetDeg);
+  long  remapBase  = (long)round((double)relAngle * (double)steps / 360.0);
+  long  nearTurn   = (long)round((double)(pos - remapBase) / (double)steps);
+  long  remapPos   = remapBase + nearTurn * steps;
 
-  long remappedBase = (long)round((double)relativeAngle * (double)steps / 360.0);
-  long nearestTurn = (long)round((double)(currentPos - remappedBase) / (double)steps);
-  long remappedPos = remappedBase + nearestTurn * steps;
-  stepper->setCurrentPosition(remappedPos);
+  rp2040.fifo.push(CMD_SET_POS | ((uint32_t)(int32_t)remapPos & 0x0FFFFFFFUL));
 
   currentStepsPerRevolution = steps;
-  savePositionToEEPROM(remappedPos);
-  lastSavedPosition = remappedPos;
+  savePositionToEEPROM(remapPos);
+  lastSavedPosition = remapPos;
 
   if (steps != lastSavedStepsPerRevolution) {
     saveStepsToEEPROM(steps);
     lastSavedStepsPerRevolution = steps;
   }
-
-  ROTATOR_SERIAL.print(F("STEPS:"));
-  ROTATOR_SERIAL.println(steps);
+  ROTATOR_SERIAL.print(F("STEPS:")); ROTATOR_SERIAL.println(steps);
 }
 
 void printPosition() {
-  float currentAngle = getCurrentAngle();
-
   ROTATOR_SERIAL.print(F("Position: "));
-  ROTATOR_SERIAL.print(currentAngle, 2);
+  ROTATOR_SERIAL.print(getCurrentAngle(), 2);
   ROTATOR_SERIAL.println(F("°"));
 }
 
 void printInfo() {
   ROTATOR_SERIAL.println(F("\n=== Settings ==="));
-  ROTATOR_SERIAL.print(F("MaxSpeed: ")); ROTATOR_SERIAL.println(currentMaxSpeed, 0);
-  ROTATOR_SERIAL.print(F("Accel: ")); ROTATOR_SERIAL.println(currentAccel, 0);
-  ROTATOR_SERIAL.print(F("PanSpeed: ")); ROTATOR_SERIAL.println(PAN_CONSTANT_SPEED);
-  ROTATOR_SERIAL.print(F("Steps/360: ")); ROTATOR_SERIAL.println(currentStepsPerRevolution);
-  ROTATOR_SERIAL.print(F("Panning: ")); ROTATOR_SERIAL.println(isPanning ? F("YES") : F("NO"));
-
-  // Show EEPROM status
+  ROTATOR_SERIAL.print(F("MaxSpeed: "));   ROTATOR_SERIAL.println(currentMaxSpeed, 0);
+  ROTATOR_SERIAL.print(F("Accel: "));      ROTATOR_SERIAL.println(currentAccel, 0);
+  ROTATOR_SERIAL.print(F("PanSpeed: "));   ROTATOR_SERIAL.println(PAN_CONSTANT_SPEED);
+  ROTATOR_SERIAL.print(F("Steps/360: "));  ROTATOR_SERIAL.println(currentStepsPerRevolution);
+  ROTATOR_SERIAL.print(F("Panning: "));    ROTATOR_SERIAL.println(sharedIsPanning ? F("YES") : F("NO"));
+  ROTATOR_SERIAL.print(F("Running: "));    ROTATOR_SERIAL.println(sharedIsRunning ? F("YES") : F("NO"));
   ROTATOR_SERIAL.print(F("Position delta: "));
-  ROTATOR_SERIAL.print(abs(stepper->getCurrentPosition() - lastSavedPosition));
+  ROTATOR_SERIAL.print(abs(sharedPosition - lastSavedPosition));
   ROTATOR_SERIAL.print(F(" (saves at ")); ROTATOR_SERIAL.print(POSITION_SAVE_THRESHOLD); ROTATOR_SERIAL.println(F(")"));
-
-  ROTATOR_SERIAL.print(F("Speed saved: "));
-  ROTATOR_SERIAL.println(abs(currentMaxSpeed - lastSavedSpeed) < 1.0 ? F("YES") : F("NO"));
-
-  ROTATOR_SERIAL.print(F("Accel saved: "));
-  ROTATOR_SERIAL.println(abs(currentAccel - lastSavedAccel) < 1.0 ? F("YES") : F("NO"));
-
   uint16_t magic;
   EEPROM.get(EEPROM_MAGIC_ADDR, magic);
-  ROTATOR_SERIAL.print(F("EEPROM Magic: 0x"));
-  ROTATOR_SERIAL.println(magic, HEX);
-
+  ROTATOR_SERIAL.print(F("EEPROM Magic: 0x")); ROTATOR_SERIAL.println(magic, HEX);
   printPosition();
-}
-
-float getCurrentAngle() {
-  long pos = stepper->getCurrentPosition();
-  float relativeAngle = (float)pos * 360.0 / currentStepsPerRevolution;
-  return normalizeAngleDeg(relativeAngle + positionAngleOffsetDeg);
 }
 
 // ========== EEPROM Functions ==========
@@ -711,7 +679,7 @@ void commitEEPROM() {
 }
 
 void forceSaveAll() {
-  long currentPos = stepper->getCurrentPosition();
+  long currentPos = sharedPosition;
   long storedPosition = (long)round((double)getCurrentAngle() * (double)currentStepsPerRevolution / 360.0);
 
   ROTATOR_SERIAL.println(F("Force saving all to EEPROM:"));
@@ -744,9 +712,9 @@ void resetEEPROM() {
   currentAccel = DEFAULT_ACCEL;
   currentStepsPerRevolution = DEFAULT_TOTAL_STEPS;
   positionAngleOffsetDeg = 0.0;
-  stepper->setCurrentPosition(0);
-  stepper->setSpeedInHz(currentMaxSpeed);
-  stepper->setAcceleration(currentAccel);
+  rp2040.fifo.push(CMD_SET_POS   | 0);
+  rp2040.fifo.push(CMD_SET_SPEED | (uint32_t)(int32_t)DEFAULT_SPEED);
+  rp2040.fifo.push(CMD_SET_ACCEL | (uint32_t)(int32_t)DEFAULT_ACCEL);
 
   lastSavedSpeed = DEFAULT_SPEED;
   lastSavedAccel = DEFAULT_ACCEL;
